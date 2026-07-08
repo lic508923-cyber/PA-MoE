@@ -78,4 +78,5 @@ class ExpertPool(nn.Module):
             "combined_logit": combined_logit,
             "hidden": combined_hidden,
             "expert_probs": probs,
+            "expert_logits": logits,
         }

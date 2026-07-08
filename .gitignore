@@ -9,3 +9,8 @@ env/
 dist/
 build/
 *.egg-info/
+checkpoints/
+outputs/
+artifacts/
+data/processed/
+.vscode/

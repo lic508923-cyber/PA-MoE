@@ -3,7 +3,7 @@
 from .dora_adalora import AdaLoRAController, DoRALinear
 from .experts import ExpertPool, LogExpert
 from .gmm_energy import GMMEnergy
-from .pa_moelog import PAMoELog
+from .pa_moelog import BertTextEncoder, PAMoELog, SimpleTextEncoder
 from .parameter_attention import (
     ParameterAwareAttention,
     ParameterAwareEncoder,
@@ -18,8 +18,10 @@ __all__ = [
     "GMMEnergy",
     "LogExpert",
     "PAMoELog",
+    "BertTextEncoder",
     "ParameterAwareAttention",
     "ParameterAwareEncoder",
     "ParameterEncoder",
+    "SimpleTextEncoder",
     "TopKSparseRouter",
 ]

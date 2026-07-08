@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import warnings
 from typing import Dict, List
 
 import torch
@@ -45,6 +46,67 @@ class SimpleTextEncoder(nn.Module):
         return int(digest, 16) % (self.vocab_size - 1) + 1
 
 
+class BertTextEncoder(nn.Module):
+    """Hugging Face BERT encoder that returns token-level hidden states."""
+
+    def __init__(self, hidden_dim: int, backbone_name: str = "bert-base-uncased", max_length: int = 32) -> None:
+        super().__init__()
+        try:
+            from transformers import AutoModel, AutoTokenizer
+        except ImportError as exc:
+            raise ImportError(
+                "BERT backbone requires the 'transformers' package. Install it with "
+                "`pip install transformers` or set backbone_name='simple-hash-encoder'."
+            ) from exc
+
+        self.hidden_dim = hidden_dim
+        self.backbone_name = backbone_name
+        self.max_length = max_length
+        self.tokenizer = AutoTokenizer.from_pretrained(backbone_name)
+        self.bert = AutoModel.from_pretrained(backbone_name)
+        bert_hidden = int(self.bert.config.hidden_size)
+        self.projection = nn.Identity() if bert_hidden == hidden_dim else nn.Linear(bert_hidden, hidden_dim)
+        self.norm = nn.LayerNorm(hidden_dim)
+
+    def forward(self, semantic_texts: List[str]) -> torch.Tensor:
+        device = next(self.bert.parameters()).device
+        encoded = self.tokenizer(
+            semantic_texts,
+            padding="max_length",
+            truncation=True,
+            max_length=self.max_length,
+            return_tensors="pt",
+        )
+        encoded = {key: value.to(device) for key, value in encoded.items()}
+        outputs = self.bert(**encoded)
+        hidden = self.projection(outputs.last_hidden_state)
+        return self.norm(hidden)
+
+
+def build_text_encoder(
+    hidden_dim: int,
+    backbone_name: str,
+    max_length: int = 32,
+    allow_hash_fallback: bool = True,
+) -> tuple[nn.Module, str]:
+    """Build the requested text encoder and return the actual encoder name."""
+
+    if backbone_name in {"simple-hash-encoder", "hash"}:
+        return SimpleTextEncoder(hidden_dim=hidden_dim, max_length=max_length), "simple-hash-encoder"
+
+    try:
+        return BertTextEncoder(hidden_dim=hidden_dim, backbone_name=backbone_name, max_length=max_length), backbone_name
+    except (ImportError, OSError, RuntimeError) as exc:
+        if not allow_hash_fallback:
+            raise
+        warnings.warn(
+            f"Falling back to simple-hash-encoder because BERT backbone '{backbone_name}' is unavailable: {exc}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return SimpleTextEncoder(hidden_dim=hidden_dim, max_length=max_length), "simple-hash-encoder"
+
+
 class PAMoELog(nn.Module):
     """仅包含前向传播的最小 PA-MoELog 骨架。"""
 
@@ -56,15 +118,22 @@ class PAMoELog(nn.Module):
         num_gmm_components: int = 4,
         alpha: float = 0.7,
         beta: float = 0.3,
-        backbone_name: str = "simple-hash-encoder",
+        backbone_name: str = "bert-base-uncased",
+        max_length: int = 32,
+        allow_hash_fallback: bool = True,
     ) -> None:
         super().__init__()
         self.hidden_dim = hidden_dim
         self.alpha = alpha
         self.beta = beta
-        self.backbone_name = backbone_name
+        self.requested_backbone_name = backbone_name
 
-        self.text_encoder = SimpleTextEncoder(hidden_dim=hidden_dim)
+        self.text_encoder, self.backbone_name = build_text_encoder(
+            hidden_dim=hidden_dim,
+            backbone_name=backbone_name,
+            max_length=max_length,
+            allow_hash_fallback=allow_hash_fallback,
+        )
         self.parameter_encoder = ParameterEncoder(hidden_dim=hidden_dim)
         self.fusion_encoder = ParameterAwareEncoder(hidden_dim=hidden_dim)
         self.router = TopKSparseRouter(hidden_dim=hidden_dim, num_experts=num_experts, top_k=top_k)
@@ -98,10 +167,12 @@ class PAMoELog(nn.Module):
         return {
             "final_score": final_score,
             "classifier_score": classifier_score,
+            "logit": expert_output["combined_logit"],
             "energy_score": energy_score,
             "router_weights": router_output["weights"],
             "selected_experts": router_output["selected_experts"],
             "router_aux_loss": router_output["aux_loss"],
+            "expert_logits": expert_output["expert_logits"],
         }
 
     @staticmethod

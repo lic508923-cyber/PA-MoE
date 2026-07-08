@@ -1,0 +1,5 @@
+log,label,system
+"Thunderbird service started successfully on port 8080",0,Thunderbird
+"Thunderbird open file /etc/passwd by user admin",0,Thunderbird
+"Thunderbird failed login from 10.10.10.10 user=root error=403",1,Thunderbird
+"Thunderbird disk failure path=/var/log/sys.log error=500",1,Thunderbird

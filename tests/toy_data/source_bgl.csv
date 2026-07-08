@@ -1,0 +1,5 @@
+log,label,system
+"BGL node boot completed successfully",0,BGL
+"BGL service heartbeat ok from 10.0.0.1",0,BGL
+"BGL fatal machine check error code=500 node=42",1,BGL
+"BGL disk read failure path=/var/log/bgl.log error=503",1,BGL

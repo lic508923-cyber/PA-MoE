@@ -1,0 +1,7 @@
+log,label,system
+"BGL node boot completed successfully",0,BGL
+"BGL fatal machine check error code=500 node=42",1,BGL
+"HDFS block report finished for user=hdfs port=8020",0,HDFS
+"HDFS failed to write block /data/blk_001 error=403",1,HDFS
+"Spark executor started successfully pid=1234",0,Spark
+"Spark executor lost at 0x000000FF error=500",1,Spark

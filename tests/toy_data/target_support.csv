@@ -1,0 +1,5 @@
+log,label,system
+"Thunderbird login accepted from 192.168.1.20 user=admin port=22",0,Thunderbird
+"Thunderbird job completed successfully pid=3456",0,Thunderbird
+"Thunderbird authentication failure from 192.168.1.99 user=root error=403",1,Thunderbird
+"Thunderbird kernel panic at 0x0000BEEF pid=9999",1,Thunderbird
