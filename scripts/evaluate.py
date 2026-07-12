@@ -37,12 +37,10 @@ def load_model(path: str, device: torch.device, backbone_override: str | None = 
     config = checkpoint.get("config", {})
     hidden_dim = int(checkpoint.get("hidden_dim", config.get("hidden_dim", 128)))
     num_experts = int(checkpoint.get("num_experts", config.get("num_experts", 3)))
-    top_k = int(checkpoint.get("top_k", config.get("top_k", 2)))
     backbone_name = backbone_override or str(config.get("backbone_name", "bert-base-uncased"))
     model = PAMoELog(
         hidden_dim=hidden_dim,
         num_experts=num_experts,
-        top_k=top_k,
         backbone_name=backbone_name,
         allow_hash_fallback=allow_hash_fallback,
     ).to(device)
@@ -81,8 +79,7 @@ def main() -> None:
             batch_classifier = output["classifier_score"].detach().cpu()
             batch_energy = output["energy_score"].detach().cpu()
             predictions = (batch_final >= args.threshold).int()
-            selected_rows = tensor_rows(output["selected_experts"])
-            weight_rows = tensor_rows(output["router_weights"])
+            weight_rows = tensor_rows(output["fusion_weights"])
 
             labels.append(batch_labels)
             final_scores.append(batch_final)
@@ -98,8 +95,7 @@ def main() -> None:
                         "final_score": float(batch_final[index].item()),
                         "classifier_score": float(batch_classifier[index].item()),
                         "energy_score": float(batch_energy[index].item()),
-                        "selected_experts": selected_rows[index],
-                        "router_weights": weight_rows[index],
+                        "fusion_weights": weight_rows[index],
                     }
                 )
 
@@ -139,8 +135,7 @@ def main() -> None:
                 "final_score",
                 "classifier_score",
                 "energy_score",
-                "selected_experts",
-                "router_weights",
+                "fusion_weights",
             ],
         )
         writer.writeheader()

@@ -25,7 +25,7 @@ def main() -> None:
     preprocessor = LogPreprocessor()
     batch = preprocessor.parse_sequence(logs)
 
-    model = PAMoELog(num_experts=3, top_k=2, hidden_dim=128)
+    model = PAMoELog(num_experts=3, hidden_dim=128, backbone_name="simple-hash-encoder")
     model.eval()
 
     with torch.no_grad():
@@ -40,8 +40,7 @@ def main() -> None:
     print("final_score:", output["final_score"])
     print("classifier_score:", output["classifier_score"])
     print("energy_score:", output["energy_score"])
-    print("router_weights:", output["router_weights"])
-    print("selected_experts:", output["selected_experts"])
+    print("fusion_weights:", output["fusion_weights"])
 
 
 if __name__ == "__main__":

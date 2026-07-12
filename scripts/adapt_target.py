@@ -14,7 +14,7 @@ if str(ROOT) not in sys.path:
 
 from pa_moelog.data import LogDataset, collate_fn
 from pa_moelog.models import PAMoELog
-from pa_moelog.models.dora_adalora import DoRALinear
+from pa_moelog.models.dora import DoRALinear
 from pa_moelog.utils import compute_binary_metrics, load_checkpoint, save_checkpoint
 
 
@@ -45,12 +45,10 @@ def model_from_checkpoint(
     config = checkpoint.get("config", {})
     hidden_dim = int(checkpoint.get("hidden_dim", config.get("hidden_dim", 128)))
     num_experts = int(checkpoint.get("num_experts", config.get("num_experts", 3)))
-    top_k = int(checkpoint.get("top_k", config.get("top_k", 2)))
     backbone_name = backbone_override or str(config.get("backbone_name", "bert-base-uncased"))
     model = PAMoELog(
         hidden_dim=hidden_dim,
         num_experts=num_experts,
-        top_k=top_k,
         backbone_name=backbone_name,
         allow_hash_fallback=allow_hash_fallback,
     ).to(device)
@@ -67,17 +65,14 @@ def set_adaptation_trainable(model: PAMoELog, freeze_backbone: bool) -> None:
     for parameter in model.parameters():
         parameter.requires_grad = False
 
-    for module in (model.router, model.gmm_energy):
-        for parameter in module.parameters():
-            parameter.requires_grad = True
-
-    for expert in model.expert_pool.experts:
-        for parameter in expert.classifier.parameters():
-            parameter.requires_grad = True
-        for module in expert.modules():
-            if isinstance(module, DoRALinear):
-                for parameter in (module.lora_a, module.lora_b, module.magnitude):
-                    parameter.requires_grad = True
+    for parameter in model.target_classifier.parameters():
+        parameter.requires_grad = True
+    for parameter in model.target_norm.parameters():
+        parameter.requires_grad = True
+    for module in model.target_adapter.modules():
+        if isinstance(module, DoRALinear):
+            for parameter in (module.lora_a, module.lora_b, module.magnitude):
+                parameter.requires_grad = True
 
 
 def train_epoch(
@@ -150,6 +145,19 @@ def main() -> None:
             f"precision={metrics['precision']:.4f} recall={metrics['recall']:.4f} f1={metrics['f1']:.4f}"
         )
 
+    normal_hidden: list[torch.Tensor] = []
+    model.eval()
+    with torch.no_grad():
+        for batch in DataLoader(dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn):
+            labels = batch["labels"].to(device)
+            output = model(batch["semantic_texts"], batch["parameters"])
+            if (labels == 0).any():
+                normal_hidden.append(output["target_hidden"][labels == 0])
+    if normal_hidden and sum(item.size(0) for item in normal_hidden) >= 2:
+        model.gmm_energy.fit_normal(torch.cat(normal_hidden, dim=0))
+    else:
+        print("[adapt][warning] fewer than two normal support samples; GMM was not recalibrated")
+
     config = vars(args).copy()
     config["backbone_name"] = model.backbone_name
     config["requested_backbone_name"] = model.requested_backbone_name
@@ -162,8 +170,7 @@ def main() -> None:
         extra={
             "target_system": args.target_system,
             "hidden_dim": model.hidden_dim,
-            "num_experts": model.router.num_experts,
-            "top_k": model.router.top_k,
+            "num_experts": model.num_experts,
         },
     )
 
