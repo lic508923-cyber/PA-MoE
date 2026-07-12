@@ -1,6 +1,6 @@
 """PA-MoELog 的模型组件。"""
 
-from .dora_adalora import AdaLoRAController, DoRALinear
+from .dora import DoRALinear
 from .experts import ExpertPool, LogExpert
 from .gmm_energy import GMMEnergy
 from .pa_moelog import BertTextEncoder, PAMoELog, SimpleTextEncoder
@@ -9,10 +9,9 @@ from .parameter_attention import (
     ParameterAwareEncoder,
     ParameterEncoder,
 )
-from .router import TopKSparseRouter
+from .fusion import LightweightExpertFusion
 
 __all__ = [
-    "AdaLoRAController",
     "DoRALinear",
     "ExpertPool",
     "GMMEnergy",
@@ -23,5 +22,5 @@ __all__ = [
     "ParameterAwareEncoder",
     "ParameterEncoder",
     "SimpleTextEncoder",
-    "TopKSparseRouter",
+    "LightweightExpertFusion",
 ]
