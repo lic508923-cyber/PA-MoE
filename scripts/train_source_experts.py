@@ -49,7 +49,14 @@ def compute_pos_weight(dataset: LogDataset, override: float | None, device: torc
 def set_trainable(model: PAMoELog, expert_id: int) -> None:
     for parameter in model.parameters():
         parameter.requires_grad = False
-    for module in (model.text_encoder, model.parameter_encoder, model.expert_pool.experts[expert_id]):
+    for module in (
+        model.text_encoder,
+        model.parameter_encoder,
+        model.fusion_encoder,
+        model.sequence_encoder,
+        model.sequence_norm,
+        model.expert_pool.experts[expert_id],
+    ):
         for parameter in module.parameters():
             parameter.requires_grad = True
 
@@ -69,16 +76,10 @@ def train_epoch(
 
     for batch in loader:
         labels = batch["labels"].to(device)
-        text_embeddings = model.text_encoder(batch["semantic_texts"])
-        parameter_embeddings = model.parameter_encoder.encode_sequence(
-            batch["parameters"],
-            seq_len=text_embeddings.size(1),
-            device=device,
+        shared_hidden = model.encode_sequences(
+            batch["semantic_texts"], batch["parameters"], batch["event_mask"].to(device)
         )
-        output = model.expert_pool.experts[expert_id](
-            text_embeddings=text_embeddings,
-            parameter_embeddings=parameter_embeddings,
-        )
+        output = model.expert_pool.experts[expert_id](shared_hidden)
         loss = criterion(output["logit"], labels)
 
         optimizer.zero_grad()

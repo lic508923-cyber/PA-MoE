@@ -93,7 +93,7 @@ class PAMoELog(nn.Module):
     def __init__(
         self, hidden_dim=128, num_experts=3, num_gmm_components=4,
         alpha=0.7, beta=0.3, backbone_name="bert-base-uncased",
-        max_length=32, allow_hash_fallback=True,
+        max_length=32, allow_hash_fallback=True, sequence_layers=1,
     ) -> None:
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -106,6 +106,14 @@ class PAMoELog(nn.Module):
         )
         self.parameter_encoder = ParameterEncoder(hidden_dim)
         self.fusion_encoder = ParameterAwareEncoder(hidden_dim)
+        sequence_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_dim, nhead=4, dim_feedforward=hidden_dim * 2,
+            dropout=0.1, batch_first=True, norm_first=False,
+        )
+        self.sequence_encoder = nn.TransformerEncoder(
+            sequence_layer, num_layers=sequence_layers, enable_nested_tensor=False
+        )
+        self.sequence_norm = nn.LayerNorm(hidden_dim)
         # 静态融合默认均匀利用全部专家，也可由目标支持集一次性校准。
         self.fusion = LightweightExpertFusion(num_experts)
         self.expert_pool = ExpertPool(num_experts, hidden_dim)
@@ -113,39 +121,78 @@ class PAMoELog(nn.Module):
         self.target_adapter = DoRALinear(hidden_dim, hidden_dim, rank=4)
         self.target_norm = nn.LayerNorm(hidden_dim)
         self.target_classifier = nn.Linear(hidden_dim, 1)
+        nn.init.zeros_(self.target_classifier.weight)
+        nn.init.zeros_(self.target_classifier.bias)
         self.gmm_energy = GMMEnergy(hidden_dim, num_gmm_components)
+        self.register_buffer("energy_location", torch.tensor(0.0))
+        self.register_buffer("energy_scale", torch.tensor(1.0))
+        self.register_buffer("energy_stats_fitted", torch.tensor(False))
 
-    def forward(self, semantic_texts: List[str], parameters: List[Dict[str, List[str]]]) -> dict:
-        """返回分类证据、能量证据、静态专家权重和最终异常分数。"""
+    def encode_events(self, semantic_texts, parameters) -> torch.Tensor:
         text_embeddings = self.text_encoder(semantic_texts)
-        parameter_embeddings = self.parameter_encoder.encode_sequence(
-            parameters, text_embeddings.size(1), text_embeddings.device
-        )
-        shared_hidden = self.fusion_encoder(text_embeddings, parameter_embeddings=parameter_embeddings)
+        parameter_embeddings, parameter_mask = self.parameter_encoder.encode_tokens(parameters, text_embeddings.device)
+        return self.fusion_encoder(text_embeddings, parameter_embeddings=parameter_embeddings, parameter_mask=parameter_mask)
+
+    def encode_sequences(self, semantic_sequences, parameter_sequences, event_mask=None) -> torch.Tensor:
+        lengths = [len(sequence) for sequence in semantic_sequences]
+        if not lengths or min(lengths) < 1:
+            raise ValueError("every sequence must contain at least one event")
+        flat_texts = [text for sequence in semantic_sequences for text in sequence]
+        flat_parameters = [item for sequence in parameter_sequences for item in sequence]
+        flat_hidden = self.encode_events(flat_texts, flat_parameters)
+        max_events = max(lengths)
+        padded = flat_hidden.new_zeros((len(lengths), max_events, self.hidden_dim))
+        mask = torch.zeros((len(lengths), max_events), dtype=torch.bool, device=flat_hidden.device)
+        cursor = 0
+        for index, length in enumerate(lengths):
+            padded[index, :length] = flat_hidden[cursor:cursor + length]
+            mask[index, :length] = True
+            cursor += length
+        if event_mask is not None:
+            mask = event_mask.to(device=mask.device, dtype=torch.bool)
+        encoded = self.sequence_encoder(padded, src_key_padding_mask=~mask)
+        weights = mask.unsqueeze(-1).to(encoded.dtype)
+        return self.sequence_norm((encoded * weights).sum(1) / weights.sum(1).clamp_min(1.0))
+
+    def forward(self, semantic_texts, parameters, event_mask: torch.Tensor | None = None) -> dict:
+        """返回分类证据、能量证据、静态专家权重和最终异常分数。"""
+        if semantic_texts and isinstance(semantic_texts[0], (list, tuple)):
+            shared_hidden = self.encode_sequences(semantic_texts, parameters, event_mask)
+        else:
+            shared_hidden = self.encode_sequences(
+                [[text] for text in semantic_texts], [[item] for item in parameters]
+            )
         fusion_weights = self.fusion(
             shared_hidden.size(0), device=shared_hidden.device, dtype=shared_hidden.dtype
         )
-        expert_output = self.expert_pool(
-            text_embeddings, fusion_weights, parameter_embeddings=parameter_embeddings
-        )
+        expert_output = self.expert_pool(shared_hidden, fusion_weights)
         target_hidden = self.target_norm(self.target_adapter(expert_output["hidden"]))
-        target_logit = self.target_classifier(target_hidden).squeeze(-1)
+        target_logit = expert_output["combined_logit"] + self.target_classifier(target_hidden).squeeze(-1)
         classifier_score = torch.sigmoid(target_logit)
-        energy_score = self._normalize_energy(self.gmm_energy(target_hidden)["energy"])
+        raw_energy = self.gmm_energy(target_hidden)["energy"]
+        energy_score = (self._normalize_energy(raw_energy) if bool(self.gmm_energy.is_fitted)
+                        else torch.full_like(raw_energy, 0.5))
         final_score = torch.clamp(self.alpha * classifier_score + self.beta * energy_score, 0.0, 1.0)
         return {
             "final_score": final_score,
             "classifier_score": classifier_score,
             "logit": target_logit,
             "energy_score": energy_score,
+            "raw_energy": raw_energy,
             "fusion_weights": fusion_weights,
             "target_hidden": target_hidden,
+            "shared_hidden": shared_hidden,
             "expert_logits": expert_output["expert_logits"],
+            "expert_hiddens": expert_output["expert_hiddens"],
         }
 
-    @staticmethod
-    def _normalize_energy(energy: torch.Tensor) -> torch.Tensor:
+    def _normalize_energy(self, energy: torch.Tensor) -> torch.Tensor:
         """将批次能量标准化到零到一之间。"""
-        if energy.numel() <= 1:
-            return torch.sigmoid(energy)
-        return torch.sigmoid((energy - energy.mean()) / energy.std(unbiased=False).clamp_min(1e-6))
+        return torch.sigmoid((energy - self.energy_location) / self.energy_scale.clamp_min(1e-6))
+
+    @torch.no_grad()
+    def fit_energy_statistics(self, hidden: torch.Tensor) -> None:
+        energy = self.gmm_energy(hidden)["energy"]
+        self.energy_location.copy_(energy.mean())
+        self.energy_scale.copy_(energy.std(unbiased=False).clamp_min(1e-6))
+        self.energy_stats_fitted.fill_(True)

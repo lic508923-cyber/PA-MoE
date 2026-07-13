@@ -1,179 +1,111 @@
+"""Few-shot adaptation with automatic support-guided fusion and post-fit GMM."""
 from __future__ import annotations
-
-import argparse
-import sys
+import argparse, sys
 from pathlib import Path
-
 import torch
 from torch import nn
 from torch.utils.data import DataLoader
-
-ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
-
-from pa_moelog.data import LogDataset, collate_fn
+ROOT=Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path: sys.path.insert(0,str(ROOT))
+from pa_moelog.data import LogDataset, LogSequenceDataset, collate_fn
 from pa_moelog.models import PAMoELog
 from pa_moelog.models.dora import DoRALinear
 from pa_moelog.utils import compute_binary_metrics, load_checkpoint, save_checkpoint
 
+def parse_args():
+    p=argparse.ArgumentParser(description="Few-shot target adaptation for PA-MoELog.")
+    p.add_argument("--support-csv",required=True); p.add_argument("--validation-csv",default=None)
+    p.add_argument("--base-checkpoint",required=True); p.add_argument("--target-system",required=True)
+    p.add_argument("--batch-size",type=int,default=32); p.add_argument("--epochs",type=int,default=5)
+    p.add_argument("--lr",type=float,default=5e-5); p.add_argument("--fusion-temperature",type=float,default=1.0)
+    p.add_argument("--output-dir",default="artifacts/checkpoints/target_adapt"); p.add_argument("--device",default="cpu")
+    p.add_argument("--backbone-name",default=None); p.add_argument("--no-hash-fallback",action="store_true")
+    p.add_argument("--sequence",action="store_true"); p.add_argument("--window-size",type=int,default=20); p.add_argument("--stride",type=int,default=None)
+    return p.parse_args()
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Few-label target-system adaptation for PA-MoELog.")
-    parser.add_argument("--support-csv", required=True)
-    parser.add_argument("--base-checkpoint", required=True)
-    parser.add_argument("--target-system", required=True)
-    parser.add_argument("--batch-size", type=int, default=32)
-    parser.add_argument("--epochs", type=int, default=5)
-    parser.add_argument("--lr", type=float, default=5e-5)
-    parser.add_argument("--lambda-energy", type=float, default=0.1)
-    parser.add_argument("--output-dir", default="artifacts/checkpoints/target_adapt")
-    parser.add_argument("--device", default="cpu")
-    parser.add_argument("--freeze-backbone", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--backbone-name", default=None)
-    parser.add_argument("--no-hash-fallback", action="store_true")
-    return parser.parse_args()
+def dataset(path,a): return LogSequenceDataset(path,a.window_size,a.stride) if a.sequence else LogDataset(path,default_system=a.target_system)
 
+def load_model(path,device,backbone=None,allow=True):
+    ck=load_checkpoint(path,map_location=device); cfg=ck.get("config",{})
+    model=PAMoELog(hidden_dim=int(ck.get("hidden_dim",cfg.get("hidden_dim",128))),
+        num_experts=int(ck.get("num_experts",cfg.get("num_experts",3))),
+        num_gmm_components=int(cfg.get("num_gmm_components",4)),
+        backbone_name=backbone or str(cfg.get("backbone_name","bert-base-uncased")),allow_hash_fallback=allow).to(device)
+    load_checkpoint(path,model=model,map_location=device)
+    if "trained_expert_mask" in ck: model.fusion.set_trained_mask(ck["trained_expert_mask"].to(device))
+    return model,ck
 
-def model_from_checkpoint(
-    path: str,
-    device: torch.device,
-    backbone_override: str | None = None,
-    allow_hash_fallback: bool = True,
-) -> tuple[PAMoELog, dict]:
-    checkpoint = load_checkpoint(path, map_location=device)
-    config = checkpoint.get("config", {})
-    hidden_dim = int(checkpoint.get("hidden_dim", config.get("hidden_dim", 128)))
-    num_experts = int(checkpoint.get("num_experts", config.get("num_experts", 3)))
-    backbone_name = backbone_override or str(config.get("backbone_name", "bert-base-uncased"))
-    model = PAMoELog(
-        hidden_dim=hidden_dim,
-        num_experts=num_experts,
-        backbone_name=backbone_name,
-        allow_hash_fallback=allow_hash_fallback,
-    ).to(device)
-    load_checkpoint(path, model=model, map_location=device)
-    return model, checkpoint
-
-
-def set_adaptation_trainable(model: PAMoELog, freeze_backbone: bool) -> None:
-    if not freeze_backbone:
-        for parameter in model.parameters():
-            parameter.requires_grad = True
-        return
-
-    for parameter in model.parameters():
-        parameter.requires_grad = False
-
-    for parameter in model.target_classifier.parameters():
-        parameter.requires_grad = True
-    for parameter in model.target_norm.parameters():
-        parameter.requires_grad = True
+def freeze_for_adaptation(model):
+    for p in model.parameters(): p.requires_grad=False
+    for p in model.target_classifier.parameters(): p.requires_grad=True
+    for p in model.target_norm.parameters(): p.requires_grad=True
     for module in model.target_adapter.modules():
-        if isinstance(module, DoRALinear):
-            for parameter in (module.lora_a, module.lora_b, module.magnitude):
-                parameter.requires_grad = True
+        if isinstance(module,DoRALinear):
+            module.lora_a.requires_grad=True; module.lora_b.requires_grad=True; module.magnitude.requires_grad=True
 
+def forward(model,batch,device):
+    return model(batch["semantic_texts"],batch["parameters"],batch["event_mask"].to(device))
 
-def train_epoch(
-    model: PAMoELog,
-    loader: DataLoader,
-    criterion: nn.Module,
-    optimizer: torch.optim.Optimizer,
-    lambda_energy: float,
-    device: torch.device,
-) -> tuple[float, float, float, dict]:
-    model.train()
-    losses: list[float] = []
-    bce_losses: list[float] = []
-    energy_losses: list[float] = []
-    all_labels: list[torch.Tensor] = []
-    all_scores: list[torch.Tensor] = []
-
+@torch.no_grad()
+def calibrate_fusion(model,loader,prototypes,temperature,device):
+    sums=torch.zeros_like(prototypes,device=device); count=0; model.eval()
     for batch in loader:
-        labels = batch["labels"].to(device)
-        output = model(batch["semantic_texts"], batch["parameters"])
-        bce_loss = criterion(output["logit"], labels)
-        energy_regularization = torch.mean((output["energy_score"] - labels).pow(2))
-        loss = bce_loss + lambda_energy * energy_regularization
+        labels=batch["labels"].to(device); normal=labels==0
+        if bool(normal.any()):
+            out=forward(model,batch,device); sums+=out["expert_hiddens"][normal].sum(0); count+=int(normal.sum())
+    if count==0: raise ValueError("support set needs at least one normal sample for fusion calibration")
+    target=sums/count; distances=torch.linalg.vector_norm(target-prototypes.to(device),dim=1)
+    model.fusion.calibrate_from_distances(distances,temperature)
+    print(f"[adapt] fusion distances={distances.cpu().tolist()} weights={model.fusion.weights.cpu().tolist()}")
 
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+@torch.no_grad()
+def collect_normal_hidden(model,loader,device):
+    result=[]; model.eval()
+    for batch in loader:
+        labels=batch["labels"].to(device); out=forward(model,batch,device)
+        if bool((labels==0).any()): result.append(out["target_hidden"][labels==0])
+    return torch.cat(result) if result else None
 
-        losses.append(float(loss.detach().cpu()))
-        bce_losses.append(float(bce_loss.detach().cpu()))
-        energy_losses.append(float(energy_regularization.detach().cpu()))
-        all_labels.append(labels.detach().cpu())
-        all_scores.append(output["final_score"].detach().cpu())
+@torch.no_grad()
+def tune_validation(model,loader,device):
+    labels=[]; cls=[]; energy=[]
+    for batch in loader:
+        out=forward(model,batch,device); labels.append(batch["labels"]); cls.append(out["classifier_score"].cpu()); energy.append(out["energy_score"].cpu())
+    labels=torch.cat(labels); cls=torch.cat(cls); energy=torch.cat(energy)
+    best=(-1.0,0.7,0.3,0.5)
+    for alpha in [i/10 for i in range(11)]:
+        scores=alpha*cls+(1-alpha)*energy
+        for threshold in [i/20 for i in range(1,20)]:
+            f1=compute_binary_metrics(labels,scores,threshold)["f1"]
+            if f1>best[0]: best=(f1,alpha,1-alpha,threshold)
+    model.alpha,model.beta=best[1],best[2]
+    print(f"[adapt] validation f1={best[0]:.4f} alpha={best[1]:.2f} beta={best[2]:.2f} threshold={best[3]:.2f}")
+    return best[3]
 
-    metrics = compute_binary_metrics(torch.cat(all_labels), torch.cat(all_scores))
-    return (
-        sum(losses) / max(len(losses), 1),
-        sum(bce_losses) / max(len(bce_losses), 1),
-        sum(energy_losses) / max(len(energy_losses), 1),
-        metrics,
-    )
-
-
-def main() -> None:
-    args = parse_args()
-    device = torch.device(args.device)
-    dataset = LogDataset(args.support_csv, default_system=args.target_system)
-    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn)
-    model, base_checkpoint = model_from_checkpoint(
-        args.base_checkpoint,
-        device,
-        backbone_override=args.backbone_name,
-        allow_hash_fallback=not args.no_hash_fallback,
-    )
-    set_adaptation_trainable(model, args.freeze_backbone)
-
-    trainable = sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
-    total = sum(parameter.numel() for parameter in model.parameters())
-    print(f"[adapt] samples={len(dataset)} target={args.target_system} trainable={trainable}/{total}")
-
-    criterion = nn.BCEWithLogitsLoss()
-    optimizer = torch.optim.AdamW((p for p in model.parameters() if p.requires_grad), lr=args.lr)
-
-    for epoch in range(1, args.epochs + 1):
-        loss, bce_loss, energy_loss, metrics = train_epoch(
-            model, loader, criterion, optimizer, args.lambda_energy, device
-        )
-        print(
-            f"[adapt][epoch {epoch}] loss={loss:.4f} bce={bce_loss:.4f} energy={energy_loss:.4f} "
-            f"precision={metrics['precision']:.4f} recall={metrics['recall']:.4f} f1={metrics['f1']:.4f}"
-        )
-
-    normal_hidden: list[torch.Tensor] = []
-    model.eval()
-    with torch.no_grad():
-        for batch in DataLoader(dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn):
-            labels = batch["labels"].to(device)
-            output = model(batch["semantic_texts"], batch["parameters"])
-            if (labels == 0).any():
-                normal_hidden.append(output["target_hidden"][labels == 0])
-    if normal_hidden and sum(item.size(0) for item in normal_hidden) >= 2:
-        model.gmm_energy.fit_normal(torch.cat(normal_hidden, dim=0))
-    else:
-        print("[adapt][warning] fewer than two normal support samples; GMM was not recalibrated")
-
-    config = vars(args).copy()
-    config["backbone_name"] = model.backbone_name
-    config["requested_backbone_name"] = model.requested_backbone_name
-    config["base_config"] = base_checkpoint.get("config", {})
-    path = Path(args.output_dir) / f"{args.target_system}_adapted.pt"
-    save_checkpoint(
-        path,
-        model,
-        config=config,
-        extra={
-            "target_system": args.target_system,
-            "hidden_dim": model.hidden_dim,
-            "num_experts": model.num_experts,
-        },
-    )
-
-
-if __name__ == "__main__":
-    main()
+def main():
+    a=parse_args(); device=torch.device(a.device); support=dataset(a.support_csv,a)
+    loader=DataLoader(support,batch_size=a.batch_size,shuffle=False,collate_fn=collate_fn)
+    model,base=load_model(a.base_checkpoint,device,a.backbone_name,not a.no_hash_fallback)
+    prototypes=base.get("source_normal_prototypes")
+    if prototypes is None: raise ValueError("base checkpoint lacks source_normal_prototypes; use train_multisource.py")
+    calibrate_fusion(model,loader,prototypes,a.fusion_temperature,device); freeze_for_adaptation(model)
+    optimizer=torch.optim.AdamW((p for p in model.parameters() if p.requires_grad),lr=a.lr); criterion=nn.BCEWithLogitsLoss()
+    train_loader=DataLoader(support,batch_size=a.batch_size,shuffle=True,collate_fn=collate_fn)
+    for epoch in range(1,a.epochs+1):
+        losses=[]; model.train()
+        for batch in train_loader:
+            labels=batch["labels"].to(device); out=forward(model,batch,device); loss=criterion(out["logit"],labels)
+            optimizer.zero_grad(); loss.backward(); optimizer.step(); losses.append(float(loss.detach()))
+        print(f"[adapt][{epoch}] bce={sum(losses)/len(losses):.4f}")
+    normal=collect_normal_hidden(model,loader,device)
+    if normal is None or normal.size(0)<2: raise ValueError("at least two normal support samples are required to fit GMM")
+    model.gmm_energy.fit_normal(normal); model.fit_energy_statistics(normal)
+    threshold=0.5
+    if a.validation_csv:
+        threshold=tune_validation(model,DataLoader(dataset(a.validation_csv,a),batch_size=a.batch_size,shuffle=False,collate_fn=collate_fn),device)
+    config=vars(a).copy(); config.update({"backbone_name":model.backbone_name,"alpha":model.alpha,"beta":model.beta,"threshold":threshold,
+        "num_gmm_components":model.gmm_energy.num_components})
+    path=Path(a.output_dir)/f"{a.target_system}_adapted.pt"
+    save_checkpoint(path,model,config,extra={"target_system":a.target_system,"hidden_dim":model.hidden_dim,"num_experts":model.num_experts,
+        "system_to_expert":base.get("system_to_expert"),"source_normal_prototypes":prototypes,"trained_expert_mask":model.fusion.trained_mask.cpu(),"threshold":threshold})
+if __name__=="__main__": main()

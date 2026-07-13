@@ -1,94 +1,77 @@
-"""CSV dataset utilities for PA-MoELog experiments."""
-
+"""Event and chronological log-sequence datasets."""
 from __future__ import annotations
-
 import csv
+from collections import defaultdict
 from pathlib import Path
 from typing import Any, Iterable
-
 import torch
 from torch.utils.data import Dataset
-
 from .preprocess import LogPreprocessor
 
+def _label(value: Any, path: Path, line: int) -> int:
+    try: result = int(float(str(value).strip()))
+    except (TypeError, ValueError) as exc: raise ValueError(f"Invalid label at {path}:{line}: {value!r}") from exc
+    if result not in (0, 1): raise ValueError(f"Label must be 0 or 1 at {path}:{line}")
+    return result
 
 class LogDataset(Dataset):
-    """Read raw log anomaly detection samples from a CSV file."""
-
-    def __init__(
-        self,
-        csv_path: str | Path,
-        log_field: str = "log",
-        label_field: str = "label",
-        system_field: str = "system",
-        default_system: str = "unknown",
-    ) -> None:
-        self.csv_path = Path(csv_path)
-        self.log_field = log_field
-        self.label_field = label_field
-        self.system_field = system_field
-        self.default_system = default_system
-        self.rows = self._read_rows()
-
-    def __len__(self) -> int:
-        return len(self.rows)
-
-    def __getitem__(self, index: int) -> dict[str, Any]:
-        row = self.rows[index]
-        return {
-            "raw_log": row["raw_log"],
-            "label": row["label"],
-            "system": row["system"],
-        }
-
-    def _read_rows(self) -> list[dict[str, Any]]:
-        if not self.csv_path.exists():
-            raise FileNotFoundError(f"CSV file not found: {self.csv_path}")
-
-        rows: list[dict[str, Any]] = []
+    """Backward-compatible dataset where one CSV row is one event sample."""
+    def __init__(self, csv_path, log_field="log", label_field="label", system_field="system", default_system="unknown"):
+        self.csv_path = Path(csv_path); self.rows = []
         with self.csv_path.open("r", encoding="utf-8-sig", newline="") as handle:
             reader = csv.DictReader(handle)
-            if reader.fieldnames is None:
-                raise ValueError(f"CSV file has no header: {self.csv_path}")
-            missing = [name for name in (self.log_field, self.label_field) if name not in reader.fieldnames]
-            if missing:
-                raise ValueError(f"CSV missing required field(s): {missing}")
+            if not reader.fieldnames or log_field not in reader.fieldnames or label_field not in reader.fieldnames:
+                raise ValueError(f"CSV must contain {log_field!r} and {label_field!r}")
+            for line, row in enumerate(reader, 2):
+                raw = (row.get(log_field) or "").strip()
+                if not raw: raise ValueError(f"Empty log at {self.csv_path}:{line}")
+                self.rows.append({"raw_log": raw, "label": _label(row.get(label_field), self.csv_path, line),
+                                  "system": (row.get(system_field) or default_system).strip() or default_system})
+        if not self.rows: raise ValueError(f"CSV file has no samples: {self.csv_path}")
+    def __len__(self): return len(self.rows)
+    def __getitem__(self, index): return self.rows[index]
 
-            for line_number, row in enumerate(reader, start=2):
-                raw_log = (row.get(self.log_field) or "").strip()
-                if not raw_log:
-                    raise ValueError(f"Empty log at {self.csv_path}:{line_number}")
-                label = self._parse_label(row.get(self.label_field), line_number)
-                system = (row.get(self.system_field) or self.default_system).strip() or self.default_system
-                rows.append({"raw_log": raw_log, "label": label, "system": system})
-
-        if not rows:
-            raise ValueError(f"CSV file has no samples: {self.csv_path}")
-        return rows
-
-    def _parse_label(self, value: Any, line_number: int) -> int:
-        try:
-            label = int(float(str(value).strip()))
-        except (TypeError, ValueError) as exc:
-            raise ValueError(f"Invalid label at {self.csv_path}:{line_number}: {value!r}") from exc
-        if label not in (0, 1):
-            raise ValueError(f"Label must be 0 or 1 at {self.csv_path}:{line_number}: {label}")
-        return label
-
+class LogSequenceDataset(Dataset):
+    """Group events by session or fixed chronological sliding windows."""
+    def __init__(self, csv_path, window_size=20, stride=None, session_field="session_id",
+                 timestamp_field="timestamp", label_mode="any", default_system="unknown"):
+        self.csv_path = Path(csv_path); self.stride = stride or window_size
+        if window_size < 1 or self.stride < 1: raise ValueError("window_size and stride must be positive")
+        with self.csv_path.open("r", encoding="utf-8-sig", newline="") as handle:
+            rows = list(csv.DictReader(handle))
+        has_sessions = any((row.get(session_field) or "").strip() for row in rows)
+        groups = defaultdict(list)
+        for index, row in enumerate(rows):
+            raw = (row.get("log") or "").strip()
+            if not raw: continue
+            system = (row.get("system") or default_system).strip() or default_system
+            session = (row.get(session_field) or "").strip()
+            key = (system, session) if session else (system, "__chronological__")
+            groups[key].append({"raw_log": raw, "label": _label(row.get("label"), self.csv_path, index + 2),
+                                "system": system, "timestamp": row.get(timestamp_field) or f"{index:012d}"})
+        self.sequences = []
+        for items in groups.values():
+            items.sort(key=lambda item: item["timestamp"])
+            windows = [items] if has_sessions and items else [items[start:start + window_size]
+                       for start in range(0, len(items), self.stride) if items[start:start + window_size]]
+            for window in windows:
+                labels = [item["label"] for item in window]
+                label = max(labels) if label_mode == "any" else labels[-1]
+                self.sequences.append({"raw_logs": [item["raw_log"] for item in window], "label": label,
+                                       "system": window[0]["system"]})
+        if not self.sequences: raise ValueError(f"CSV file has no sequences: {self.csv_path}")
+    def __len__(self): return len(self.sequences)
+    def __getitem__(self, index): return self.sequences[index]
 
 def collate_fn(batch: Iterable[dict[str, Any]]) -> dict[str, Any]:
-    """Collate raw logs and run parser-free preprocessing."""
-
-    items = list(batch)
-    raw_logs = [item["raw_log"] for item in items]
-    labels = torch.tensor([item["label"] for item in items], dtype=torch.float32)
-    systems = [item["system"] for item in items]
-
-    parsed = LogPreprocessor().parse_sequence(raw_logs)
-    return {
-        "raw_logs": raw_logs,
-        "semantic_texts": parsed["semantic_texts"],
-        "parameters": parsed["parameters"],
-        "labels": labels,
-        "systems": systems,
-    }
+    items = list(batch); preprocessor = LogPreprocessor()
+    raw_sequences = [item["raw_logs"] if "raw_logs" in item else [item["raw_log"]] for item in items]
+    parsed = [preprocessor.parse_sequence(sequence) for sequence in raw_sequences]
+    max_events = max(len(sequence) for sequence in raw_sequences)
+    event_mask = torch.zeros((len(items), max_events), dtype=torch.bool)
+    for index, sequence in enumerate(raw_sequences): event_mask[index, :len(sequence)] = True
+    return {"raw_logs": [sequence[0] if len(sequence) == 1 else sequence for sequence in raw_sequences],
+            "semantic_texts": [item["semantic_texts"] for item in parsed],
+            "parameters": [item["parameters"] for item in parsed], "event_mask": event_mask,
+            "labels": torch.tensor([item["label"] for item in items], dtype=torch.float32),
+            "systems": [item["system"] for item in items]}

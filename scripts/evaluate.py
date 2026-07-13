@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from pa_moelog.data import LogDataset, collate_fn
+from pa_moelog.data import LogDataset, LogSequenceDataset, collate_fn
 from pa_moelog.models import PAMoELog
 from pa_moelog.utils import compute_binary_metrics, load_checkpoint
 
@@ -23,12 +23,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--test-csv", required=True)
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--batch-size", type=int, default=64)
-    parser.add_argument("--threshold", type=float, default=0.5)
+    parser.add_argument("--threshold", type=float, default=None)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--output-json", required=True)
     parser.add_argument("--backbone-name", default=None)
     parser.add_argument("--no-hash-fallback", action="store_true")
     parser.add_argument("--basic-metrics-only", action="store_true")
+    parser.add_argument("--sequence", action="store_true")
+    parser.add_argument("--window-size", type=int, default=20)
+    parser.add_argument("--stride", type=int, default=None)
     return parser.parse_args()
 
 
@@ -41,6 +44,9 @@ def load_model(path: str, device: torch.device, backbone_override: str | None = 
     model = PAMoELog(
         hidden_dim=hidden_dim,
         num_experts=num_experts,
+        num_gmm_components=int(config.get("num_gmm_components", 4)),
+        alpha=float(config.get("alpha", 0.7)),
+        beta=float(config.get("beta", 0.3)),
         backbone_name=backbone_name,
         allow_hash_fallback=allow_hash_fallback,
     ).to(device)
@@ -56,7 +62,8 @@ def tensor_rows(tensor: torch.Tensor) -> list[str]:
 def main() -> None:
     args = parse_args()
     device = torch.device(args.device)
-    dataset = LogDataset(args.test_csv)
+    dataset = (LogSequenceDataset(args.test_csv, args.window_size, args.stride)
+               if args.sequence else LogDataset(args.test_csv))
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn)
     model = load_model(
         args.checkpoint,
@@ -64,6 +71,8 @@ def main() -> None:
         backbone_override=args.backbone_name,
         allow_hash_fallback=not args.no_hash_fallback,
     )
+    checkpoint = load_checkpoint(args.checkpoint, map_location=device)
+    threshold = args.threshold if args.threshold is not None else float(checkpoint.get("threshold", checkpoint.get("config", {}).get("threshold", 0.5)))
 
     labels: list[torch.Tensor] = []
     final_scores: list[torch.Tensor] = []
@@ -73,12 +82,12 @@ def main() -> None:
 
     with torch.no_grad():
         for batch in loader:
-            output = model(batch["semantic_texts"], batch["parameters"])
+            output = model(batch["semantic_texts"], batch["parameters"], batch["event_mask"].to(device))
             batch_labels = batch["labels"].detach().cpu()
             batch_final = output["final_score"].detach().cpu()
             batch_classifier = output["classifier_score"].detach().cpu()
             batch_energy = output["energy_score"].detach().cpu()
-            predictions = (batch_final >= args.threshold).int()
+            predictions = (batch_final >= threshold).int()
             weight_rows = tensor_rows(output["fusion_weights"])
 
             labels.append(batch_labels)
@@ -101,10 +110,10 @@ def main() -> None:
 
     y_true = torch.cat(labels)
     y_score = torch.cat(final_scores)
-    metrics = compute_binary_metrics(y_true, y_score, threshold=args.threshold)
+    metrics = compute_binary_metrics(y_true, y_score, threshold=threshold)
     result = {
         **metrics,
-        "threshold": args.threshold,
+        "threshold": threshold,
         "average_final_score": float(torch.cat(final_scores).mean().item()),
         "average_classifier_score": float(torch.cat(classifier_scores).mean().item()),
         "average_energy_score": float(torch.cat(energy_scores).mean().item()),
@@ -115,7 +124,7 @@ def main() -> None:
             "precision": metrics["precision"],
             "recall": metrics["recall"],
             "f1": metrics["f1"],
-            "threshold": args.threshold,
+            "threshold": threshold,
             "num_samples": len(dataset),
         }
 
