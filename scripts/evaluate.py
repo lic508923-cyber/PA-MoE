@@ -15,7 +15,7 @@ if str(ROOT) not in sys.path:
 
 from pa_moelog.data import LogDataset, LogSequenceDataset, collate_fn
 from pa_moelog.models import PAMoELog
-from pa_moelog.utils import compute_binary_metrics, load_checkpoint
+from pa_moelog.utils import compute_binary_metrics, load_checkpoint, restore_checkpoint
 
 
 def parse_args() -> argparse.Namespace:
@@ -27,7 +27,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--output-json", required=True)
     parser.add_argument("--backbone-name", default=None)
-    parser.add_argument("--no-hash-fallback", action="store_true")
+    parser.add_argument("--debug-hash-encoder", action="store_true")
     parser.add_argument("--basic-metrics-only", action="store_true")
     parser.add_argument("--sequence", action="store_true")
     parser.add_argument("--window-size", type=int, default=20)
@@ -35,8 +35,9 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def load_model(path: str, device: torch.device, backbone_override: str | None = None, allow_hash_fallback: bool = True) -> PAMoELog:
-    checkpoint = load_checkpoint(path, map_location=device)
+def load_model(path: str, device: torch.device, backbone_override: str | None = None,
+               allow_hash_fallback: bool = False, checkpoint: dict | None = None) -> PAMoELog:
+    checkpoint = checkpoint or load_checkpoint(path, map_location=device)
     config = checkpoint.get("config", {})
     hidden_dim = int(checkpoint.get("hidden_dim", config.get("hidden_dim", 128)))
     num_experts = int(checkpoint.get("num_experts", config.get("num_experts", 3)))
@@ -47,10 +48,16 @@ def load_model(path: str, device: torch.device, backbone_override: str | None = 
         num_gmm_components=int(config.get("num_gmm_components", 4)),
         alpha=float(config.get("alpha", 0.7)),
         beta=float(config.get("beta", 0.3)),
+        max_events=int(config.get("max_events", 512)),
+        gmm_projection_dim=int(config.get("gmm_projection_dim", 32)),
+        fusion_shrinkage_strength=float(config.get("fusion_shrinkage_strength", 16.0)),
+        sequence_layers=int(config.get("sequence_layers", 1)),
+        dora_rank=int(config.get("dora_rank", 4)),
         backbone_name=backbone_name,
         allow_hash_fallback=allow_hash_fallback,
     ).to(device)
-    load_checkpoint(path, model=model, map_location=device)
+    restore_checkpoint(checkpoint, model, strict=True)
+    model._checkpoint_metadata = checkpoint
     model.eval()
     return model
 
@@ -59,20 +66,32 @@ def tensor_rows(tensor: torch.Tensor) -> list[str]:
     return [json.dumps(row, ensure_ascii=False) for row in tensor.detach().cpu().tolist()]
 
 
+def validate_checkpoint_mode(config: dict, sequence: bool) -> None:
+    if bool(config.get("sequence", False)) != bool(sequence):
+        raise ValueError("evaluation mode does not match checkpoint sequence mode")
+
+
 def main() -> None:
     args = parse_args()
     device = torch.device(args.device)
     dataset = (LogSequenceDataset(args.test_csv, args.window_size, args.stride)
                if args.sequence else LogDataset(args.test_csv))
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn)
+    metadata = load_checkpoint(args.checkpoint, map_location=device)
+    config = metadata.get("config", {})
+    validate_checkpoint_mode(config, args.sequence)
+    backbone = args.backbone_name or str(config.get("backbone_name", "bert-base-uncased"))
+    if backbone in {"hash", "simple-hash-encoder"} and not args.debug_hash_encoder:
+        raise ValueError("hash encoder is debug-only; pass --debug-hash-encoder explicitly")
     model = load_model(
         args.checkpoint,
         device,
         backbone_override=args.backbone_name,
-        allow_hash_fallback=not args.no_hash_fallback,
+        allow_hash_fallback=args.debug_hash_encoder,
+        checkpoint=metadata,
     )
-    checkpoint = load_checkpoint(args.checkpoint, map_location=device)
-    threshold = args.threshold if args.threshold is not None else float(checkpoint.get("threshold", checkpoint.get("config", {}).get("threshold", 0.5)))
+    checkpoint_config = model._checkpoint_metadata
+    threshold = args.threshold if args.threshold is not None else float(checkpoint_config.get("threshold", checkpoint_config.get("config", {}).get("threshold", 0.5)))
 
     labels: list[torch.Tensor] = []
     final_scores: list[torch.Tensor] = []

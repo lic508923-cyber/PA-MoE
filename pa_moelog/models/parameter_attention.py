@@ -112,7 +112,6 @@ class ParameterAwareEncoder(nn.Module):
 
     def __init__(self, hidden_dim: int, num_heads: int = 4, dropout: float = 0.1) -> None:
         super().__init__()
-        self.parameter_encoder = ParameterEncoder(hidden_dim)
         self.attention = ParameterAwareAttention(hidden_dim, num_heads, dropout)
         self.gate = nn.Parameter(torch.tensor(1.0))
         self.attention_norm = nn.LayerNorm(hidden_dim)
@@ -127,17 +126,14 @@ class ParameterAwareEncoder(nn.Module):
     def forward(
         self,
         text_embeddings: torch.Tensor,
-        parameters: List[Dict[str, List[str]]] | None = None,
-        parameter_embeddings: torch.Tensor | None = None,
-        parameter_mask: torch.Tensor | None = None,
+        parameter_embeddings: torch.Tensor,
+        parameter_mask: torch.Tensor,
+        text_mask: torch.Tensor,
     ) -> torch.Tensor:
-        if parameter_embeddings is None:
-            if parameters is None:
-                raise ValueError("parameters or parameter_embeddings must be provided")
-            parameter_embeddings, parameter_mask = self.parameter_encoder.encode_tokens(
-                parameters, text_embeddings.device
-            )
+        if text_mask.shape != text_embeddings.shape[:2]:
+            raise ValueError("text_mask must match the first two text embedding dimensions")
         attended = self.attention(text_embeddings, parameter_embeddings, parameter_mask)
         hidden = self.attention_norm(text_embeddings + torch.tanh(self.gate) * attended)
         hidden = self.output_norm(hidden + self.ffn(hidden))
-        return hidden.mean(dim=1)
+        weights = text_mask.unsqueeze(-1).to(hidden.dtype)
+        return (hidden * weights).sum(dim=1) / weights.sum(dim=1).clamp_min(1.0)

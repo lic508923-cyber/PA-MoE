@@ -4,13 +4,14 @@ import argparse, sys
 from pathlib import Path
 import torch
 from torch import nn
+from torch.nn import functional as F
 from torch.utils.data import DataLoader
 ROOT=Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path: sys.path.insert(0,str(ROOT))
 from pa_moelog.data import LogDataset, LogSequenceDataset, collate_fn
 from pa_moelog.models import PAMoELog
 from pa_moelog.models.dora import DoRALinear
-from pa_moelog.utils import compute_binary_metrics, load_checkpoint, save_checkpoint
+from pa_moelog.utils import compute_binary_metrics, load_checkpoint, restore_checkpoint, save_checkpoint
 
 def parse_args():
     p=argparse.ArgumentParser(description="Few-shot target adaptation for PA-MoELog.")
@@ -18,20 +19,24 @@ def parse_args():
     p.add_argument("--base-checkpoint",required=True); p.add_argument("--target-system",required=True)
     p.add_argument("--batch-size",type=int,default=32); p.add_argument("--epochs",type=int,default=5)
     p.add_argument("--lr",type=float,default=5e-5); p.add_argument("--fusion-temperature",type=float,default=1.0)
+    p.add_argument("--fusion-shrinkage",type=float,default=None)
     p.add_argument("--output-dir",default="artifacts/checkpoints/target_adapt"); p.add_argument("--device",default="cpu")
-    p.add_argument("--backbone-name",default=None); p.add_argument("--no-hash-fallback",action="store_true")
+    p.add_argument("--backbone-name",default=None); p.add_argument("--debug-hash-encoder",action="store_true")
     p.add_argument("--sequence",action="store_true"); p.add_argument("--window-size",type=int,default=20); p.add_argument("--stride",type=int,default=None)
     return p.parse_args()
 
 def dataset(path,a): return LogSequenceDataset(path,a.window_size,a.stride) if a.sequence else LogDataset(path,default_system=a.target_system)
 
-def load_model(path,device,backbone=None,allow=True):
-    ck=load_checkpoint(path,map_location=device); cfg=ck.get("config",{})
+def load_model(path,device,backbone=None,allow=False,checkpoint=None):
+    ck=checkpoint or load_checkpoint(path,map_location=device); cfg=ck.get("config",{})
     model=PAMoELog(hidden_dim=int(ck.get("hidden_dim",cfg.get("hidden_dim",128))),
         num_experts=int(ck.get("num_experts",cfg.get("num_experts",3))),
         num_gmm_components=int(cfg.get("num_gmm_components",4)),
-        backbone_name=backbone or str(cfg.get("backbone_name","bert-base-uncased")),allow_hash_fallback=allow).to(device)
-    load_checkpoint(path,model=model,map_location=device)
+        backbone_name=backbone or str(cfg.get("backbone_name","bert-base-uncased")),allow_hash_fallback=allow,
+        max_events=int(cfg.get("max_events",512)),gmm_projection_dim=int(cfg.get("gmm_projection_dim",32)),
+        fusion_shrinkage_strength=float(cfg.get("fusion_shrinkage_strength",16.0)),
+        sequence_layers=int(cfg.get("sequence_layers",1)),dora_rank=int(cfg.get("dora_rank",4))).to(device)
+    restore_checkpoint(ck,model,strict=True)
     if "trained_expert_mask" in ck: model.fusion.set_trained_mask(ck["trained_expert_mask"].to(device))
     return model,ck
 
@@ -47,15 +52,16 @@ def forward(model,batch,device):
     return model(batch["semantic_texts"],batch["parameters"],batch["event_mask"].to(device))
 
 @torch.no_grad()
-def calibrate_fusion(model,loader,prototypes,temperature,device):
+def calibrate_fusion(model,loader,prototypes,temperature,device,label_budget):
     sums=torch.zeros_like(prototypes,device=device); count=0; model.eval()
     for batch in loader:
         labels=batch["labels"].to(device); normal=labels==0
         if bool(normal.any()):
             out=forward(model,batch,device); sums+=out["expert_hiddens"][normal].sum(0); count+=int(normal.sum())
     if count==0: raise ValueError("support set needs at least one normal sample for fusion calibration")
-    target=sums/count; distances=torch.linalg.vector_norm(target-prototypes.to(device),dim=1)
-    model.fusion.calibrate_from_distances(distances,temperature)
+    target=F.normalize(sums/count,dim=1); source=F.normalize(prototypes.to(device),dim=1)
+    distances=1.0-(target*source).sum(dim=1)
+    model.fusion.calibrate_from_distances(distances,temperature,label_budget=label_budget)
     print(f"[adapt] fusion distances={distances.cpu().tolist()} weights={model.fusion.weights.cpu().tolist()}")
 
 @torch.no_grad()
@@ -85,11 +91,22 @@ def tune_validation(model,loader,device):
 def main():
     a=parse_args(); device=torch.device(a.device); support=dataset(a.support_csv,a)
     loader=DataLoader(support,batch_size=a.batch_size,shuffle=False,collate_fn=collate_fn)
-    model,base=load_model(a.base_checkpoint,device,a.backbone_name,not a.no_hash_fallback)
+    base_metadata=load_checkpoint(a.base_checkpoint,map_location=device); base_config=base_metadata.get("config",{})
+    if bool(base_config.get("sequence",False)) != bool(a.sequence):
+        raise ValueError("target adaptation mode must match the source checkpoint sequence mode")
+    backbone=a.backbone_name or str(base_config.get("backbone_name","bert-base-uncased"))
+    if backbone in {"hash","simple-hash-encoder"} and not a.debug_hash_encoder:
+        raise ValueError("hash encoder is debug-only; pass --debug-hash-encoder explicitly")
+    model,base=load_model(a.base_checkpoint,device,a.backbone_name,a.debug_hash_encoder,base_metadata)
+    if a.fusion_shrinkage is not None: model.fusion.shrinkage_strength=float(a.fusion_shrinkage)
     prototypes=base.get("source_normal_prototypes")
     if prototypes is None: raise ValueError("base checkpoint lacks source_normal_prototypes; use train_multisource.py")
-    calibrate_fusion(model,loader,prototypes,a.fusion_temperature,device); freeze_for_adaptation(model)
-    optimizer=torch.optim.AdamW((p for p in model.parameters() if p.requires_grad),lr=a.lr); criterion=nn.BCEWithLogitsLoss()
+    calibrate_fusion(model,loader,prototypes,a.fusion_temperature,device,len(support)); freeze_for_adaptation(model)
+    support_rows=support.sequences if isinstance(support,LogSequenceDataset) else support.rows
+    positives=sum(row["label"] for row in support_rows); negatives=len(support_rows)-positives
+    pos_weight=(torch.tensor(negatives/positives,device=device) if positives and negatives else None)
+    optimizer=torch.optim.AdamW((p for p in model.parameters() if p.requires_grad),lr=a.lr)
+    criterion=nn.BCEWithLogitsLoss(pos_weight=pos_weight)
     train_loader=DataLoader(support,batch_size=a.batch_size,shuffle=True,collate_fn=collate_fn)
     for epoch in range(1,a.epochs+1):
         losses=[]; model.train()
@@ -104,8 +121,10 @@ def main():
     if a.validation_csv:
         threshold=tune_validation(model,DataLoader(dataset(a.validation_csv,a),batch_size=a.batch_size,shuffle=False,collate_fn=collate_fn),device)
     config=vars(a).copy(); config.update({"backbone_name":model.backbone_name,"alpha":model.alpha,"beta":model.beta,"threshold":threshold,
-        "num_gmm_components":model.gmm_energy.num_components})
+        "num_gmm_components":model.gmm_energy.num_components,"gmm_projection_dim":model.gmm_energy.projection_dim,
+        "max_events":model.max_events,"fusion_shrinkage_strength":model.fusion.shrinkage_strength,
+        "sequence_layers":model.sequence_layers,"dora_rank":model.target_adapter.rank})
     path=Path(a.output_dir)/f"{a.target_system}_adapted.pt"
-    save_checkpoint(path,model,config,extra={"target_system":a.target_system,"hidden_dim":model.hidden_dim,"num_experts":model.num_experts,
+    save_checkpoint(path,model,config,extra={"checkpoint_schema_version":2,"target_system":a.target_system,"hidden_dim":model.hidden_dim,"num_experts":model.num_experts,
         "system_to_expert":base.get("system_to_expert"),"source_normal_prototypes":prototypes,"trained_expert_mask":model.fusion.trained_mask.cpu(),"threshold":threshold})
 if __name__=="__main__": main()

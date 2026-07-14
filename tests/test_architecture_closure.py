@@ -13,7 +13,8 @@ class ArchitectureClosureTest(unittest.TestCase):
     def test_gmm_components_are_fitted_and_distinct(self):
         torch.manual_seed(1); hidden=torch.cat([torch.randn(20,4)-3,torch.randn(20,4)+3])
         gmm=GMMEnergy(4,2); gmm.fit_normal(hidden)
-        self.assertTrue(bool(gmm.is_fitted)); self.assertFalse(torch.allclose(gmm.means[0],gmm.means[1]))
+        self.assertTrue(bool(gmm.is_fitted)); self.assertEqual(int(gmm.active_components),2)
+        self.assertFalse(torch.allclose(gmm.means[0],gmm.means[1]))
 
     def test_untrained_expert_is_excluded(self):
         fusion=LightweightExpertFusion(3); fusion.set_trained_mask(torch.tensor([True,False,True]))
@@ -32,6 +33,8 @@ class ArchitectureClosureTest(unittest.TestCase):
     def test_energy_score_is_batch_invariant_after_fit(self):
         torch.manual_seed(3); model=PAMoELog(hidden_dim=16,num_experts=1,backbone_name="simple-hash-encoder")
         normal=torch.randn(8,16); model.gmm_energy.fit_normal(normal); model.fit_energy_statistics(normal)
+        self.assertEqual(int(model.gmm_energy.active_components),1)
+        self.assertLessEqual(int(model.gmm_energy.active_projection_dim),7)
         one=model._normalize_energy(model.gmm_energy(normal[:1])["energy"])
         many=model._normalize_energy(model.gmm_energy(normal[:4])["energy"])
         self.assertTrue(torch.allclose(one,many[:1]))

@@ -27,12 +27,14 @@ class SimpleTextEncoder(nn.Module):
         self.position_embedding = nn.Embedding(max_length, hidden_dim)
         self.norm = nn.LayerNorm(hidden_dim)
 
-    def forward(self, semantic_texts: List[str]) -> torch.Tensor:
+    def forward(self, semantic_texts: List[str]) -> tuple[torch.Tensor, torch.Tensor]:
         """将文本转换为带位置编码的词元级隐藏状态。"""
         device = self.embedding.weight.device
         input_ids = torch.tensor([self._tokenize(text) for text in semantic_texts], device=device)
         positions = torch.arange(self.max_length, device=device).unsqueeze(0)
-        return self.norm(self.embedding(input_ids) + self.position_embedding(positions))
+        mask = input_ids.ne(0)
+        hidden = self.norm(self.embedding(input_ids) + self.position_embedding(positions))
+        return hidden * mask.unsqueeze(-1).to(hidden.dtype), mask
 
     def _tokenize(self, text: str) -> list[int]:
         """按空格切分文本并映射到稳定哈希词表。"""
@@ -60,15 +62,18 @@ class BertTextEncoder(nn.Module):
         self.projection = nn.Identity() if bert_hidden == hidden_dim else nn.Linear(bert_hidden, hidden_dim)
         self.norm = nn.LayerNorm(hidden_dim)
 
-    def forward(self, semantic_texts: List[str]) -> torch.Tensor:
+    def forward(self, semantic_texts: List[str]) -> tuple[torch.Tensor, torch.Tensor]:
         """完成分词、BERT 编码与目标隐藏维投影。"""
         device = next(self.bert.parameters()).device
         encoded = self.tokenizer(
             semantic_texts, padding="max_length", truncation=True,
             max_length=self.max_length, return_tensors="pt",
         )
-        outputs = self.bert(**{key: value.to(device) for key, value in encoded.items()})
-        return self.norm(self.projection(outputs.last_hidden_state))
+        encoded = {key: value.to(device) for key, value in encoded.items()}
+        outputs = self.bert(**encoded)
+        mask = encoded["attention_mask"].bool()
+        hidden = self.norm(self.projection(outputs.last_hidden_state))
+        return hidden * mask.unsqueeze(-1).to(hidden.dtype), mask
 
 
 def build_text_encoder(hidden_dim, backbone_name, max_length=32, allow_hash_fallback=True):
@@ -93,7 +98,8 @@ class PAMoELog(nn.Module):
     def __init__(
         self, hidden_dim=128, num_experts=3, num_gmm_components=4,
         alpha=0.7, beta=0.3, backbone_name="bert-base-uncased",
-        max_length=32, allow_hash_fallback=True, sequence_layers=1,
+        max_length=32, allow_hash_fallback=False, sequence_layers=1,
+        max_events=512, gmm_projection_dim=32, fusion_shrinkage_strength=16.0, dora_rank=4,
     ) -> None:
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -101,6 +107,8 @@ class PAMoELog(nn.Module):
         self.beta = beta
         self.num_experts = num_experts
         self.requested_backbone_name = backbone_name
+        self.max_events = max_events
+        self.sequence_layers = sequence_layers
         self.text_encoder, self.backbone_name = build_text_encoder(
             hidden_dim, backbone_name, max_length, allow_hash_fallback
         )
@@ -113,25 +121,42 @@ class PAMoELog(nn.Module):
         self.sequence_encoder = nn.TransformerEncoder(
             sequence_layer, num_layers=sequence_layers, enable_nested_tensor=False
         )
+        self.event_position_embedding = nn.Embedding(max_events, hidden_dim)
         self.sequence_norm = nn.LayerNorm(hidden_dim)
         # 静态融合默认均匀利用全部专家，也可由目标支持集一次性校准。
-        self.fusion = LightweightExpertFusion(num_experts)
+        self.fusion = LightweightExpertFusion(num_experts, shrinkage_strength=fusion_shrinkage_strength)
         self.expert_pool = ExpertPool(num_experts, hidden_dim)
         # 共享 DoRA 位于专家融合之后，是目标域主要的可训练适配参数。
-        self.target_adapter = DoRALinear(hidden_dim, hidden_dim, rank=4)
+        self.target_adapter = DoRALinear(hidden_dim, hidden_dim, rank=dora_rank)
         self.target_norm = nn.LayerNorm(hidden_dim)
         self.target_classifier = nn.Linear(hidden_dim, 1)
         nn.init.zeros_(self.target_classifier.weight)
         nn.init.zeros_(self.target_classifier.bias)
-        self.gmm_energy = GMMEnergy(hidden_dim, num_gmm_components)
+        self.gmm_energy = GMMEnergy(hidden_dim, num_gmm_components, projection_dim=gmm_projection_dim)
         self.register_buffer("energy_location", torch.tensor(0.0))
         self.register_buffer("energy_scale", torch.tensor(1.0))
         self.register_buffer("energy_stats_fitted", torch.tensor(False))
 
     def encode_events(self, semantic_texts, parameters) -> torch.Tensor:
-        text_embeddings = self.text_encoder(semantic_texts)
+        text_embeddings, text_mask = self.text_encoder(semantic_texts)
         parameter_embeddings, parameter_mask = self.parameter_encoder.encode_tokens(parameters, text_embeddings.device)
-        return self.fusion_encoder(text_embeddings, parameter_embeddings=parameter_embeddings, parameter_mask=parameter_mask)
+        return self.fusion_encoder(
+            text_embeddings,
+            parameter_embeddings=parameter_embeddings,
+            parameter_mask=parameter_mask,
+            text_mask=text_mask,
+        )
+
+    def checkpoint_signature(self) -> dict:
+        return {
+            "backbone_name": self.backbone_name,
+            "hidden_dim": self.hidden_dim,
+            "num_experts": self.num_experts,
+            "sequence_layers": self.sequence_layers,
+            "max_events": self.max_events,
+            "dora_rank": self.target_adapter.rank,
+            "gmm_projection_dim": self.gmm_energy.projection_dim,
+        }
 
     def encode_sequences(self, semantic_sequences, parameter_sequences, event_mask=None) -> torch.Tensor:
         lengths = [len(sequence) for sequence in semantic_sequences]
@@ -141,6 +166,8 @@ class PAMoELog(nn.Module):
         flat_parameters = [item for sequence in parameter_sequences for item in sequence]
         flat_hidden = self.encode_events(flat_texts, flat_parameters)
         max_events = max(lengths)
+        if max_events > self.max_events:
+            raise ValueError(f"sequence has {max_events} events but max_events={self.max_events}")
         padded = flat_hidden.new_zeros((len(lengths), max_events, self.hidden_dim))
         mask = torch.zeros((len(lengths), max_events), dtype=torch.bool, device=flat_hidden.device)
         cursor = 0
@@ -149,7 +176,14 @@ class PAMoELog(nn.Module):
             mask[index, :length] = True
             cursor += length
         if event_mask is not None:
-            mask = event_mask.to(device=mask.device, dtype=torch.bool)
+            if tuple(event_mask.shape) != tuple(mask.shape):
+                raise ValueError(f"event_mask shape {tuple(event_mask.shape)} does not match {tuple(mask.shape)}")
+            supplied = event_mask.to(device=mask.device, dtype=torch.bool)
+            if not torch.equal(supplied.sum(1).cpu(), torch.tensor(lengths)):
+                raise ValueError("event_mask counts must match sequence lengths")
+            mask = supplied
+        positions = torch.arange(max_events, device=padded.device)
+        padded = padded + self.event_position_embedding(positions).unsqueeze(0)
         encoded = self.sequence_encoder(padded, src_key_padding_mask=~mask)
         weights = mask.unsqueeze(-1).to(encoded.dtype)
         return self.sequence_norm((encoded * weights).sum(1) / weights.sum(1).clamp_min(1.0))

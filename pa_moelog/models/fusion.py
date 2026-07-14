@@ -7,11 +7,12 @@ from torch import nn
 
 
 class LightweightExpertFusion(nn.Module):
-    def __init__(self, num_experts: int) -> None:
+    def __init__(self, num_experts: int, shrinkage_strength: float = 16.0) -> None:
         super().__init__()
         if num_experts < 1:
             raise ValueError("num_experts must be positive")
         self.num_experts = num_experts
+        self.shrinkage_strength = float(shrinkage_strength)
         self.register_buffer("weights", torch.full((num_experts,), 1.0 / num_experts))
         self.register_buffer("trained_mask", torch.ones(num_experts, dtype=torch.bool))
 
@@ -34,7 +35,8 @@ class LightweightExpertFusion(nn.Module):
         self.weights.copy_(weights / weights.sum())
 
     @torch.no_grad()
-    def calibrate_from_distances(self, distances: torch.Tensor, temperature: float = 1.0) -> None:
+    def calibrate_from_distances(self, distances: torch.Tensor, temperature: float = 1.0,
+                                 label_budget: int | None = None) -> None:
         if temperature <= 0:
             raise ValueError("temperature must be positive")
         distances = torch.as_tensor(distances, dtype=self.weights.dtype, device=self.weights.device)
@@ -42,7 +44,14 @@ class LightweightExpertFusion(nn.Module):
             raise ValueError(f"distances must have shape ({self.num_experts},)")
         logits = -distances / temperature
         logits = logits.masked_fill(~self.trained_mask, float("-inf"))
-        self.set_weights(torch.softmax(logits, dim=0))
+        calibrated = torch.softmax(logits, dim=0)
+        if label_budget is not None:
+            if label_budget < 0:
+                raise ValueError("label_budget cannot be negative")
+            prior = self.trained_mask.to(calibrated.dtype); prior = prior / prior.sum()
+            reliability = label_budget / (label_budget + self.shrinkage_strength)
+            calibrated = reliability * calibrated + (1.0 - reliability) * prior
+        self.set_weights(calibrated)
 
     def forward(self, batch_size: int, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
         return self.weights.to(device=device, dtype=dtype).unsqueeze(0).expand(batch_size, -1)

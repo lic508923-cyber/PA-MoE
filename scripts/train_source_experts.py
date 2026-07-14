@@ -18,7 +18,7 @@ from pa_moelog.utils import compute_binary_metrics, save_checkpoint
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train one PA-MoELog source expert.")
+    parser = argparse.ArgumentParser(description="Legacy single-expert baseline; formal experiments must use train_multisource.py.")
     parser.add_argument("--train-csv", required=True)
     parser.add_argument("--system-name", required=True)
     parser.add_argument("--num-experts", type=int, default=3)
@@ -31,7 +31,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--pos-weight", type=float, default=None)
     parser.add_argument("--backbone-name", default="bert-base-uncased")
-    parser.add_argument("--no-hash-fallback", action="store_true")
+    parser.add_argument("--debug-hash-encoder", action="store_true")
     return parser.parse_args()
 
 
@@ -54,6 +54,7 @@ def set_trainable(model: PAMoELog, expert_id: int) -> None:
         model.parameter_encoder,
         model.fusion_encoder,
         model.sequence_encoder,
+        model.event_position_embedding,
         model.sequence_norm,
         model.expert_pool.experts[expert_id],
     ):
@@ -100,13 +101,15 @@ def main() -> None:
         raise ValueError("--expert-id must be in [0, num_experts).")
 
     device = torch.device(args.device)
+    if args.backbone_name in {"hash", "simple-hash-encoder"} and not args.debug_hash_encoder:
+        raise ValueError("hash encoder is debug-only; pass --debug-hash-encoder explicitly")
     dataset = LogDataset(args.train_csv, default_system=args.system_name)
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn)
     model = PAMoELog(
         hidden_dim=args.hidden_dim,
         num_experts=args.num_experts,
         backbone_name=args.backbone_name,
-        allow_hash_fallback=not args.no_hash_fallback,
+        allow_hash_fallback=args.debug_hash_encoder,
     ).to(device)
     set_trainable(model, args.expert_id)
 
