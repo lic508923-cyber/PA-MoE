@@ -100,6 +100,7 @@ class PAMoELog(nn.Module):
         alpha=0.7, beta=0.3, backbone_name="bert-base-uncased",
         max_length=32, allow_hash_fallback=False, sequence_layers=1,
         max_events=512, gmm_projection_dim=32, fusion_shrinkage_strength=16.0, dora_rank=4,
+        disable_parameters=False, disable_gmm=False,
     ) -> None:
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -109,6 +110,8 @@ class PAMoELog(nn.Module):
         self.requested_backbone_name = backbone_name
         self.max_events = max_events
         self.sequence_layers = sequence_layers
+        self.disable_parameters = disable_parameters
+        self.disable_gmm = disable_gmm
         self.text_encoder, self.backbone_name = build_text_encoder(
             hidden_dim, backbone_name, max_length, allow_hash_fallback
         )
@@ -139,7 +142,11 @@ class PAMoELog(nn.Module):
 
     def encode_events(self, semantic_texts, parameters) -> torch.Tensor:
         text_embeddings, text_mask = self.text_encoder(semantic_texts)
-        parameter_embeddings, parameter_mask = self.parameter_encoder.encode_tokens(parameters, text_embeddings.device)
+        if self.disable_parameters:
+            parameter_embeddings=text_embeddings.new_zeros((text_embeddings.size(0),1,self.hidden_dim))
+            parameter_mask=torch.zeros((text_embeddings.size(0),1),dtype=torch.bool,device=text_embeddings.device)
+        else:
+            parameter_embeddings, parameter_mask = self.parameter_encoder.encode_tokens(parameters, text_embeddings.device)
         return self.fusion_encoder(
             text_embeddings,
             parameter_embeddings=parameter_embeddings,
@@ -156,6 +163,8 @@ class PAMoELog(nn.Module):
             "max_events": self.max_events,
             "dora_rank": self.target_adapter.rank,
             "gmm_projection_dim": self.gmm_energy.projection_dim,
+            "disable_parameters": self.disable_parameters,
+            "disable_gmm": self.disable_gmm,
         }
 
     def encode_sequences(self, semantic_sequences, parameter_sequences, event_mask=None) -> torch.Tensor:
@@ -204,9 +213,10 @@ class PAMoELog(nn.Module):
         target_logit = expert_output["combined_logit"] + self.target_classifier(target_hidden).squeeze(-1)
         classifier_score = torch.sigmoid(target_logit)
         raw_energy = self.gmm_energy(target_hidden)["energy"]
-        energy_score = (self._normalize_energy(raw_energy) if bool(self.gmm_energy.is_fitted)
+        energy_score = (self._normalize_energy(raw_energy) if not self.disable_gmm and bool(self.gmm_energy.is_fitted)
                         else torch.full_like(raw_energy, 0.5))
-        final_score = torch.clamp(self.alpha * classifier_score + self.beta * energy_score, 0.0, 1.0)
+        final_score = (classifier_score if self.disable_gmm else
+                       torch.clamp(self.alpha * classifier_score + self.beta * energy_score, 0.0, 1.0))
         return {
             "final_score": final_score,
             "classifier_score": classifier_score,

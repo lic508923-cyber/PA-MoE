@@ -24,6 +24,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--threshold", type=float, default=None)
+    parser.add_argument("--fixed-recall", type=float, default=0.95)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--output-json", required=True)
     parser.add_argument("--backbone-name", default=None)
@@ -53,6 +54,8 @@ def load_model(path: str, device: torch.device, backbone_override: str | None = 
         fusion_shrinkage_strength=float(config.get("fusion_shrinkage_strength", 16.0)),
         sequence_layers=int(config.get("sequence_layers", 1)),
         dora_rank=int(config.get("dora_rank", 4)),
+        disable_parameters=bool(config.get("disable_parameters", False)),
+        disable_gmm=bool(config.get("disable_gmm", False)),
         backbone_name=backbone_name,
         allow_hash_fallback=allow_hash_fallback,
     ).to(device)
@@ -129,7 +132,25 @@ def main() -> None:
 
     y_true = torch.cat(labels)
     y_score = torch.cat(final_scores)
-    metrics = compute_binary_metrics(y_true, y_score, threshold=threshold)
+    metrics = compute_binary_metrics(
+        y_true, y_score, threshold=threshold, fixed_recall=args.fixed_recall
+    )
+    total_parameters = int(checkpoint_config.get(
+        "total_parameters", sum(parameter.numel() for parameter in model.parameters())
+    ))
+    trainable_parameters = int(checkpoint_config.get(
+        "trainable_parameters", sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
+    ))
+    efficiency = {
+        "trainable_parameters": trainable_parameters,
+        "total_parameters": total_parameters,
+        "trainable_parameter_ratio": float(checkpoint_config.get(
+            "trainable_parameter_ratio", trainable_parameters / max(total_parameters, 1)
+        )),
+        "adaptation_seconds": checkpoint_config.get("adaptation_seconds"),
+        "peak_memory_bytes": checkpoint_config.get("peak_memory_bytes"),
+        "checkpoint_size_bytes": Path(args.checkpoint).stat().st_size,
+    }
     result = {
         **metrics,
         "threshold": threshold,
@@ -137,14 +158,27 @@ def main() -> None:
         "average_classifier_score": float(torch.cat(classifier_scores).mean().item()),
         "average_energy_score": float(torch.cat(energy_scores).mean().item()),
         "num_samples": len(dataset),
+        "efficiency": efficiency,
+        "ablation": {
+            "disable_parameters": bool(config.get("disable_parameters", False)),
+            "fusion": config.get("fusion", "source-trained"),
+            "adaptation": config.get("adaptation", "source-training"),
+            "disable_gmm": bool(config.get("disable_gmm", False)),
+            "single_source": config.get("single_source"),
+            "pooled_source": bool(config.get("pooled_source", False)),
+        },
     }
     if args.basic_metrics_only:
         result = {
             "precision": metrics["precision"],
             "recall": metrics["recall"],
             "f1": metrics["f1"],
+            "fpr": metrics["fpr"],
+            "fixed_recall": metrics["fixed_recall"],
+            "fpr_at_fixed_recall": metrics["fpr_at_fixed_recall"],
             "threshold": threshold,
             "num_samples": len(dataset),
+            "efficiency": efficiency,
         }
 
     output_json = Path(args.output_json)

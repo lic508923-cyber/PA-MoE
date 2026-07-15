@@ -1,4 +1,5 @@
 import csv
+import json
 import subprocess
 import sys
 import tempfile
@@ -7,7 +8,8 @@ from pathlib import Path
 import torch
 from pa_moelog.data import LogSequenceDataset
 from pa_moelog.models import LightweightExpertFusion,PAMoELog,ParameterEncoder
-from pa_moelog.utils import load_checkpoint,save_checkpoint
+from pa_moelog.utils import compute_binary_metrics,load_checkpoint,save_checkpoint
+from scripts.adapt_target import set_adaptation_trainable
 from scripts.evaluate import validate_checkpoint_mode
 from scripts.train_multisource import SystemBalancedBatchSampler
 
@@ -91,6 +93,91 @@ class SequenceAndTrainingSafetyTest(unittest.TestCase):
         self.assertTrue(torch.allclose(fusion.weights,torch.tensor([.5,.5])))
         fusion.calibrate_from_distances(torch.tensor([0.0,10.0]),label_budget=1000)
         self.assertGreater(float(fusion.weights[0]),.98)
+
+    def test_nested_supports_are_prefixes_for_each_seed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); source=root/"events.csv"; output=root/"supports"
+            with source.open("w",encoding="utf-8",newline="") as handle:
+                writer=csv.DictWriter(handle,fieldnames=["log","label","system","timestamp"]); writer.writeheader()
+                for index in range(12):
+                    writer.writerow({"log":f"event-{index}","label":int(index%3==0),"system":"A","timestamp":index})
+            script=Path(__file__).resolve().parents[1]/"scripts"/"generate_nested_support.py"
+            subprocess.run([sys.executable,str(script),"--input-csv",str(source),"--output-dir",str(output),
+                            "--budgets","2","5","10","--seeds","3","9"],check=True,capture_output=True,text=True)
+            manifest=json.loads((output/"nested_support_manifest.json").read_text(encoding="utf-8"))
+            for seed in ("3","9"):
+                self.assertEqual(manifest["seeds"][seed]["2"],manifest["seeds"][seed]["5"][:2])
+                self.assertEqual(manifest["seeds"][seed]["5"],manifest["seeds"][seed]["10"][:5])
+                with (output/f"seed_{seed}"/"support_B5.csv").open(encoding="utf-8") as handle:
+                    self.assertEqual(sum(1 for _ in csv.DictReader(handle)),5)
+
+    def test_sequence_support_defaults_to_non_overlapping_windows(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); source=root/"events.csv"; output=root/"supports"
+            with source.open("w",encoding="utf-8",newline="") as handle:
+                writer=csv.DictWriter(handle,fieldnames=["log","label","system","timestamp"]); writer.writeheader()
+                for index in range(12):
+                    writer.writerow({"log":f"event-{index}","label":int(index%5==0),"system":"A","timestamp":index})
+            script=Path(__file__).resolve().parents[1]/"scripts"/"generate_nested_support.py"
+            subprocess.run([sys.executable,str(script),"--input-csv",str(source),"--output-dir",str(output),
+                            "--budgets","2","3","--seeds","1","--sequence","--window-size","3"],
+                           check=True,capture_output=True,text=True)
+            with (output/"seed_1"/"support_B3.csv").open(encoding="utf-8") as handle:
+                rows=list(csv.DictReader(handle))
+            self.assertEqual(len(rows),9)
+            sessions={row["session_id"] for row in rows}
+            self.assertEqual(len(sessions),3)
+            self.assertTrue(all(sum(row["session_id"]==session for row in rows)==3 for session in sessions))
+
+    def test_disable_parameters_and_gmm_ablation(self):
+        torch.manual_seed(10)
+        model=PAMoELog(hidden_dim=16,num_experts=1,backbone_name="simple-hash-encoder",
+                       disable_parameters=True,disable_gmm=True); model.eval()
+        first={**EMPTY,"NUM":["1"]}; second={**EMPTY,"NUM":["999"]}
+        with torch.no_grad():
+            first_output=model(["same event"],[first])
+            second_output=model(["same event"],[second])
+        self.assertTrue(torch.allclose(first_output["logit"],second_output["logit"],atol=1e-6))
+        self.assertTrue(torch.equal(first_output["final_score"],first_output["classifier_score"]))
+
+    def test_adaptation_modes_control_trainable_parameter_budget(self):
+        model=PAMoELog(hidden_dim=16,num_experts=1,backbone_name="simple-hash-encoder")
+        counts=[]
+        for mode in ("head-only","dora","full"):
+            set_adaptation_trainable(model,mode)
+            counts.append(sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad))
+        self.assertLess(counts[0],counts[1]); self.assertLess(counts[1],counts[2])
+
+    def test_fpr_and_fpr_at_fixed_recall(self):
+        metrics=compute_binary_metrics([0,0,1,1],[0.9,0.1,0.8,0.7],threshold=.5,fixed_recall=1.0)
+        self.assertEqual(metrics["fpr"],.5)
+        self.assertEqual(metrics["fpr_at_fixed_recall"],.5)
+
+    def test_ablation_adaptation_and_efficiency_output_end_to_end(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); base=root/"base.pt"; support=root/"support.csv"; output=root/"adapted"
+            model=PAMoELog(hidden_dim=8,num_experts=2,backbone_name="simple-hash-encoder")
+            save_checkpoint(base,model,{"hidden_dim":8,"num_experts":2,"sequence":False,
+                            "backbone_name":"simple-hash-encoder","disable_parameters":False,"disable_gmm":False},
+                            extra={"hidden_dim":8,"num_experts":2,"source_normal_prototypes":torch.randn(2,8),
+                                   "trained_expert_mask":torch.ones(2,dtype=torch.bool)})
+            with support.open("w",encoding="utf-8",newline="") as handle:
+                writer=csv.DictWriter(handle,fieldnames=["log","label","system"]); writer.writeheader()
+                for index,label in enumerate((0,0,1,1)):
+                    writer.writerow({"log":f"target event {index}","label":label,"system":"T"})
+            script=Path(__file__).resolve().parents[1]/"scripts"/"adapt_target.py"
+            subprocess.run([sys.executable,str(script),"--support-csv",str(support),"--base-checkpoint",str(base),
+                            "--target-system","T","--output-dir",str(output),"--epochs","1",
+                            "--fusion","uniform","--adaptation","head-only","--disable-gmm",
+                            "--debug-hash-encoder"],cwd=root,check=True,capture_output=True,text=True)
+            checkpoint=load_checkpoint(output/"T_adapted.pt")
+            efficiency=json.loads((output/"T_efficiency.json").read_text(encoding="utf-8"))
+            self.assertEqual(checkpoint["config"]["fusion"],"uniform")
+            self.assertEqual(checkpoint["config"]["adaptation"],"head-only")
+            self.assertTrue(checkpoint["config"]["disable_gmm"])
+            self.assertGreater(efficiency["trainable_parameters"],0)
+            self.assertLess(efficiency["trainable_parameter_ratio"],1)
+            self.assertEqual(efficiency["checkpoint_size_bytes"],(output/"T_adapted.pt").stat().st_size)
 
     def test_checkpoint_loading_is_strict(self):
         with tempfile.TemporaryDirectory() as directory:

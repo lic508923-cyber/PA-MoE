@@ -23,6 +23,9 @@ def args():
     p.add_argument("--sequence",action="store_true"); p.add_argument("--window-size",type=int,default=20); p.add_argument("--stride",type=int,default=None)
     p.add_argument("--max-events",type=int,default=512); p.add_argument("--sequence-layers",type=int,default=1)
     p.add_argument("--dora-rank",type=int,default=4); p.add_argument("--gmm-projection-dim",type=int,default=32)
+    p.add_argument("--disable-parameters",action="store_true"); p.add_argument("--disable-gmm",action="store_true")
+    source_group=p.add_mutually_exclusive_group(); source_group.add_argument("--single-source",default=None)
+    source_group.add_argument("--pooled-source",action="store_true")
     p.add_argument("--output",default="artifacts/checkpoints/multisource.pt"); return p.parse_args()
 
 def make_dataset(path,a):
@@ -71,13 +74,21 @@ def main():
     a=args(); torch.manual_seed(a.seed); device=torch.device(a.device)
     train=make_dataset(a.train_csv,a); validation=make_dataset(a.validation_csv,a)
     train_rows=records(train); validation_rows=records(validation); systems=sorted({row["system"] for row in train_rows})
+    if a.single_source:
+        train_rows[:]=[row for row in train_rows if row["system"]==a.single_source]
+        validation_rows[:]=[row for row in validation_rows if row["system"]==a.single_source]
+        if not train_rows or not validation_rows: raise ValueError(f"single source {a.single_source!r} is missing from train or validation")
+    if a.pooled_source:
+        for row in train_rows+validation_rows: row["system"]="__pooled__"
+    systems=sorted({row["system"] for row in train_rows})
     if {row["system"] for row in validation_rows} != set(systems): raise ValueError("validation must contain exactly the training source systems")
     system_to_expert={name:index for index,name in enumerate(systems)}
     if a.backbone_name in {"hash","simple-hash-encoder"} and not a.debug_hash_encoder:
         raise ValueError("hash encoder is debug-only; pass --debug-hash-encoder explicitly")
     model=PAMoELog(hidden_dim=a.hidden_dim,num_experts=len(systems),backbone_name=a.backbone_name,
         allow_hash_fallback=a.debug_hash_encoder,max_events=a.max_events,gmm_projection_dim=a.gmm_projection_dim,
-        sequence_layers=a.sequence_layers,dora_rank=a.dora_rank).to(device)
+        sequence_layers=a.sequence_layers,dora_rank=a.dora_rank,disable_parameters=a.disable_parameters,
+        disable_gmm=a.disable_gmm).to(device)
     model.fusion.set_trained_mask(torch.ones(len(systems),dtype=torch.bool,device=device))
     loader=DataLoader(train,batch_sampler=SystemBalancedBatchSampler(train_rows,a.batch_size,a.seed),collate_fn=collate_fn)
     validation_loader=DataLoader(validation,batch_size=a.batch_size,shuffle=False,collate_fn=collate_fn)

@@ -30,7 +30,12 @@ def _to_numpy(values: Any) -> np.ndarray:
     return np.asarray(values)
 
 
-def compute_binary_metrics(y_true: Any, y_score: Any, threshold: float = 0.5) -> dict[str, Any]:
+def compute_binary_metrics(
+    y_true: Any,
+    y_score: Any,
+    threshold: float = 0.5,
+    fixed_recall: float = 0.95,
+) -> dict[str, Any]:
     """Compute threshold metrics plus AUROC/AUPRC when labels allow it."""
 
     true = _to_numpy(y_true).astype(int).reshape(-1)
@@ -39,6 +44,8 @@ def compute_binary_metrics(y_true: Any, y_score: Any, threshold: float = 0.5) ->
 
     if true.size == 0:
         raise ValueError("Cannot compute metrics on an empty input.")
+    if not 0.0 <= fixed_recall <= 1.0:
+        raise ValueError("fixed_recall must be between 0 and 1.")
 
     if precision_score is not None:
         precision = float(precision_score(true, pred, zero_division=0))
@@ -55,6 +62,22 @@ def compute_binary_metrics(y_true: Any, y_score: Any, threshold: float = 0.5) ->
         f1 = 2.0 * precision * recall / (precision + recall) if precision + recall else 0.0
         cm = [[tn, fp], [fn, tp]]
 
+    negatives = int((true == 0).sum())
+    positives = int((true == 1).sum())
+    fpr = float(cm[0][1] / negatives) if negatives else None
+    fpr_at_fixed_recall = None
+    if positives and negatives:
+        # Evaluating each distinct score also handles tied predictions correctly.
+        candidate_thresholds = np.concatenate(([np.inf], np.unique(score)[::-1], [-np.inf]))
+        feasible_fprs = []
+        for candidate in candidate_thresholds:
+            candidate_pred = score >= candidate
+            candidate_recall = float(((true == 1) & candidate_pred).sum() / positives)
+            if candidate_recall >= fixed_recall:
+                feasible_fprs.append(float(((true == 0) & candidate_pred).sum() / negatives))
+        if feasible_fprs:
+            fpr_at_fixed_recall = min(feasible_fprs)
+
     auroc = None
     auprc = None
     if np.unique(true).size > 1:
@@ -69,5 +92,8 @@ def compute_binary_metrics(y_true: Any, y_score: Any, threshold: float = 0.5) ->
         "f1": f1,
         "auroc": auroc,
         "auprc": auprc,
+        "fpr": fpr,
+        "fixed_recall": fixed_recall,
+        "fpr_at_fixed_recall": fpr_at_fixed_recall,
         "confusion_matrix": cm,
     }

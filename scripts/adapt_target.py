@@ -1,6 +1,6 @@
 """Few-shot adaptation with automatic support-guided fusion and post-fit GMM."""
 from __future__ import annotations
-import argparse, sys
+import argparse, json, sys, time
 from pathlib import Path
 import torch
 from torch import nn
@@ -20,6 +20,10 @@ def parse_args():
     p.add_argument("--batch-size",type=int,default=32); p.add_argument("--epochs",type=int,default=5)
     p.add_argument("--lr",type=float,default=5e-5); p.add_argument("--fusion-temperature",type=float,default=1.0)
     p.add_argument("--fusion-shrinkage",type=float,default=None)
+    p.add_argument("--fusion",choices=["uniform","support-guided"],default="support-guided")
+    p.add_argument("--adaptation",choices=["head-only","dora","full"],default="dora")
+    p.add_argument("--disable-parameters",action=argparse.BooleanOptionalAction,default=None)
+    p.add_argument("--disable-gmm",action=argparse.BooleanOptionalAction,default=None)
     p.add_argument("--output-dir",default="artifacts/checkpoints/target_adapt"); p.add_argument("--device",default="cpu")
     p.add_argument("--backbone-name",default=None); p.add_argument("--debug-hash-encoder",action="store_true")
     p.add_argument("--sequence",action="store_true"); p.add_argument("--window-size",type=int,default=20); p.add_argument("--stride",type=int,default=None)
@@ -35,18 +39,23 @@ def load_model(path,device,backbone=None,allow=False,checkpoint=None):
         backbone_name=backbone or str(cfg.get("backbone_name","bert-base-uncased")),allow_hash_fallback=allow,
         max_events=int(cfg.get("max_events",512)),gmm_projection_dim=int(cfg.get("gmm_projection_dim",32)),
         fusion_shrinkage_strength=float(cfg.get("fusion_shrinkage_strength",16.0)),
-        sequence_layers=int(cfg.get("sequence_layers",1)),dora_rank=int(cfg.get("dora_rank",4))).to(device)
+        sequence_layers=int(cfg.get("sequence_layers",1)),dora_rank=int(cfg.get("dora_rank",4)),
+        disable_parameters=bool(cfg.get("disable_parameters",False)),disable_gmm=bool(cfg.get("disable_gmm",False))).to(device)
     restore_checkpoint(ck,model,strict=True)
     if "trained_expert_mask" in ck: model.fusion.set_trained_mask(ck["trained_expert_mask"].to(device))
     return model,ck
 
-def freeze_for_adaptation(model):
+def set_adaptation_trainable(model,mode):
     for p in model.parameters(): p.requires_grad=False
     for p in model.target_classifier.parameters(): p.requires_grad=True
-    for p in model.target_norm.parameters(): p.requires_grad=True
-    for module in model.target_adapter.modules():
-        if isinstance(module,DoRALinear):
-            module.lora_a.requires_grad=True; module.lora_b.requires_grad=True; module.magnitude.requires_grad=True
+    if mode in {"dora","full"}:
+        for p in model.target_norm.parameters(): p.requires_grad=True
+    if mode=="dora":
+        for module in model.target_adapter.modules():
+            if isinstance(module,DoRALinear):
+                module.lora_a.requires_grad=True; module.lora_b.requires_grad=True; module.magnitude.requires_grad=True
+    if mode=="full":
+        for p in model.parameters(): p.requires_grad=True
 
 def forward(model,batch,device):
     return model(batch["semantic_texts"],batch["parameters"],batch["event_mask"].to(device))
@@ -79,7 +88,8 @@ def tune_validation(model,loader,device):
         out=forward(model,batch,device); labels.append(batch["labels"]); cls.append(out["classifier_score"].cpu()); energy.append(out["energy_score"].cpu())
     labels=torch.cat(labels); cls=torch.cat(cls); energy=torch.cat(energy)
     best=(-1.0,0.7,0.3,0.5)
-    for alpha in [i/10 for i in range(11)]:
+    alphas=[1.0] if model.disable_gmm else [i/10 for i in range(11)]
+    for alpha in alphas:
         scores=alpha*cls+(1-alpha)*energy
         for threshold in [i/20 for i in range(1,20)]:
             f1=compute_binary_metrics(labels,scores,threshold)["f1"]
@@ -98,10 +108,23 @@ def main():
     if backbone in {"hash","simple-hash-encoder"} and not a.debug_hash_encoder:
         raise ValueError("hash encoder is debug-only; pass --debug-hash-encoder explicitly")
     model,base=load_model(a.base_checkpoint,device,a.backbone_name,a.debug_hash_encoder,base_metadata)
+    source_disable_parameters=bool(base_config.get("disable_parameters",False))
+    if a.disable_parameters is not None and a.disable_parameters!=source_disable_parameters:
+        raise ValueError("--disable-parameters must match the source checkpoint; retrain the source ablation")
+    model.disable_parameters=source_disable_parameters
+    model.disable_gmm=bool(base_config.get("disable_gmm",False) if a.disable_gmm is None else a.disable_gmm)
+    adaptation_start=time.perf_counter()
+    if device.type=="cuda": torch.cuda.reset_peak_memory_stats(device)
     if a.fusion_shrinkage is not None: model.fusion.shrinkage_strength=float(a.fusion_shrinkage)
     prototypes=base.get("source_normal_prototypes")
-    if prototypes is None: raise ValueError("base checkpoint lacks source_normal_prototypes; use train_multisource.py")
-    calibrate_fusion(model,loader,prototypes,a.fusion_temperature,device,len(support)); freeze_for_adaptation(model)
+    if a.fusion=="support-guided":
+        if prototypes is None: raise ValueError("support-guided fusion requires source_normal_prototypes")
+        calibrate_fusion(model,loader,prototypes,a.fusion_temperature,device,len(support))
+    else:
+        model.fusion.set_weights(model.fusion.trained_mask.to(model.fusion.weights.dtype))
+    set_adaptation_trainable(model,a.adaptation)
+    trainable_parameters=sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total_parameters=sum(p.numel() for p in model.parameters())
     support_rows=support.sequences if isinstance(support,LogSequenceDataset) else support.rows
     positives=sum(row["label"] for row in support_rows); negatives=len(support_rows)-positives
     pos_weight=(torch.tensor(negatives/positives,device=device) if positives and negatives else None)
@@ -114,17 +137,28 @@ def main():
             labels=batch["labels"].to(device); out=forward(model,batch,device); loss=criterion(out["logit"],labels)
             optimizer.zero_grad(); loss.backward(); optimizer.step(); losses.append(float(loss.detach()))
         print(f"[adapt][{epoch}] bce={sum(losses)/len(losses):.4f}")
-    normal=collect_normal_hidden(model,loader,device)
-    if normal is None or normal.size(0)<2: raise ValueError("at least two normal support samples are required to fit GMM")
-    model.gmm_energy.fit_normal(normal); model.fit_energy_statistics(normal)
+    if not model.disable_gmm:
+        normal=collect_normal_hidden(model,loader,device)
+        if normal is None or normal.size(0)<2: raise ValueError("at least two normal support samples are required to fit GMM")
+        model.gmm_energy.fit_normal(normal); model.fit_energy_statistics(normal)
     threshold=0.5
     if a.validation_csv:
         threshold=tune_validation(model,DataLoader(dataset(a.validation_csv,a),batch_size=a.batch_size,shuffle=False,collate_fn=collate_fn),device)
+    adaptation_seconds=time.perf_counter()-adaptation_start
+    peak_memory_bytes=(torch.cuda.max_memory_allocated(device) if device.type=="cuda" else 0)
     config=vars(a).copy(); config.update({"backbone_name":model.backbone_name,"alpha":model.alpha,"beta":model.beta,"threshold":threshold,
         "num_gmm_components":model.gmm_energy.num_components,"gmm_projection_dim":model.gmm_energy.projection_dim,
         "max_events":model.max_events,"fusion_shrinkage_strength":model.fusion.shrinkage_strength,
-        "sequence_layers":model.sequence_layers,"dora_rank":model.target_adapter.rank})
+        "sequence_layers":model.sequence_layers,"dora_rank":model.target_adapter.rank,
+        "disable_parameters":model.disable_parameters,"disable_gmm":model.disable_gmm})
     path=Path(a.output_dir)/f"{a.target_system}_adapted.pt"
     save_checkpoint(path,model,config,extra={"checkpoint_schema_version":2,"target_system":a.target_system,"hidden_dim":model.hidden_dim,"num_experts":model.num_experts,
-        "system_to_expert":base.get("system_to_expert"),"source_normal_prototypes":prototypes,"trained_expert_mask":model.fusion.trained_mask.cpu(),"threshold":threshold})
+        "system_to_expert":base.get("system_to_expert"),"source_normal_prototypes":prototypes,"trained_expert_mask":model.fusion.trained_mask.cpu(),"threshold":threshold,
+        "trainable_parameters":trainable_parameters,"total_parameters":total_parameters,
+        "trainable_parameter_ratio":trainable_parameters/max(total_parameters,1),"adaptation_seconds":adaptation_seconds,
+        "peak_memory_bytes":peak_memory_bytes})
+    efficiency={"trainable_parameters":trainable_parameters,"total_parameters":total_parameters,
+        "trainable_parameter_ratio":trainable_parameters/max(total_parameters,1),"adaptation_seconds":adaptation_seconds,
+        "peak_memory_bytes":peak_memory_bytes,"checkpoint_size_bytes":path.stat().st_size}
+    (Path(a.output_dir)/f"{a.target_system}_efficiency.json").write_text(json.dumps(efficiency,indent=2),encoding="utf-8")
 if __name__=="__main__": main()

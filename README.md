@@ -112,3 +112,39 @@ python -m unittest discover -s tests -p "test_*.py" -v
 ```bash
 python scripts/summarize_multiseed.py seed1.json seed2.json seed3.json --output summary.json
 ```
+
+## Nested few-shot supports and ablations
+
+Create one nested support family per seed. In sequence mode the default support
+stride equals `window-size`, so the label budget counts non-overlapping windows:
+
+```bash
+python scripts/generate_nested_support.py \
+  --input-csv data/splits/support_pool.csv \
+  --output-dir data/nested_support \
+  --budgets 10 50 100 500 2000 \
+  --seeds 1 2 3 4 5 \
+  --sequence --window-size 20
+```
+
+For each seed, `support_B10.csv` is a subset of `support_B50.csv`, and so on.
+`nested_support_manifest.json` records the selected sample IDs for auditing.
+
+The common experiment scripts expose the following ablations without copying
+model code:
+
+```text
+train_multisource.py: --disable-parameters --disable-gmm
+                      --single-source SYSTEM | --pooled-source
+adapt_target.py:      --fusion uniform|support-guided
+                      --adaptation head-only|dora|full
+                      --disable-gmm
+```
+
+`--disable-parameters` changes the source model architecture and must therefore
+be selected during source training. Target adaptation verifies that its setting
+matches the source checkpoint. Evaluation JSON includes FPR,
+FPR-at-fixed-recall (default recall 0.95), the active ablation configuration,
+trainable/total parameter counts, trainable ratio, adaptation time, peak CUDA
+memory, and checkpoint size. Use `evaluate.py --fixed-recall VALUE` to change
+the operating recall.
