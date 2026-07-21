@@ -30,6 +30,50 @@ def _to_numpy(values: Any) -> np.ndarray:
     return np.asarray(values)
 
 
+def select_best_f1_threshold(y_true: Any, y_score: Any) -> dict[str, float]:
+    """Select the exact score threshold that maximizes validation F1.
+
+    Every distinct score is evaluated with tied scores entering together.  If
+    several thresholds have the same F1, the highest threshold is retained so
+    the selected operating point predicts fewer anomalies.
+    """
+
+    true = _to_numpy(y_true).astype(int).reshape(-1)
+    score = _to_numpy(y_score).astype(float).reshape(-1)
+    if true.size == 0 or true.size != score.size:
+        raise ValueError("y_true and y_score must be non-empty and have equal length.")
+    if not np.isin(true, [0, 1]).all():
+        raise ValueError("y_true must contain only binary labels 0 and 1.")
+
+    order = np.argsort(-score, kind="stable")
+    sorted_score = score[order]
+    sorted_true = true[order]
+    group_ends = np.flatnonzero(np.r_[sorted_score[:-1] != sorted_score[1:], True])
+    true_positives = np.cumsum(sorted_true)[group_ends].astype(float)
+    predicted_positives = (group_ends + 1).astype(float)
+    positives = float(sorted_true.sum())
+    precision = np.divide(
+        true_positives,
+        predicted_positives,
+        out=np.zeros_like(true_positives),
+        where=predicted_positives > 0,
+    )
+    recall = true_positives / positives if positives else np.zeros_like(true_positives)
+    f1 = np.divide(
+        2.0 * precision * recall,
+        precision + recall,
+        out=np.zeros_like(precision),
+        where=(precision + recall) > 0,
+    )
+    best = int(np.argmax(f1))
+    return {
+        "threshold": float(sorted_score[group_ends[best]]),
+        "f1": float(f1[best]),
+        "precision": float(precision[best]),
+        "recall": float(recall[best]),
+    }
+
+
 def compute_binary_metrics(
     y_true: Any,
     y_score: Any,

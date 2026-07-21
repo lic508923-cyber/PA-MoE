@@ -232,11 +232,14 @@ class PAMoELog(nn.Module):
 
     def _normalize_energy(self, energy: torch.Tensor) -> torch.Tensor:
         """将批次能量标准化到零到一之间。"""
-        return torch.sigmoid((energy - self.energy_location) / self.energy_scale.clamp_min(1e-6))
+        # A nearly constant few-shot support can produce a standard deviation at
+        # floating-point noise scale. Do not amplify that noise into a material
+        # anomaly-score change (energy is measured in negative log-likelihood units).
+        return torch.sigmoid((energy - self.energy_location) / self.energy_scale.clamp_min(0.1))
 
     @torch.no_grad()
     def fit_energy_statistics(self, hidden: torch.Tensor) -> None:
         energy = self.gmm_energy(hidden)["energy"]
         self.energy_location.copy_(energy.mean())
-        self.energy_scale.copy_(energy.std(unbiased=False).clamp_min(1e-6))
+        self.energy_scale.copy_(energy.std(unbiased=False).clamp_min(0.1))
         self.energy_stats_fitted.fill_(True)
