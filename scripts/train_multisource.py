@@ -24,6 +24,8 @@ def args():
     p.add_argument("--max-events",type=int,default=512); p.add_argument("--sequence-layers",type=int,default=1)
     p.add_argument("--dora-rank",type=int,default=4); p.add_argument("--gmm-projection-dim",type=int,default=32)
     p.add_argument("--disable-parameters",action="store_true"); p.add_argument("--disable-gmm",action="store_true")
+    p.add_argument("--freeze-backbone",action="store_true",
+                   help="Freeze the pretrained text backbone while training PA-MoELog heads.")
     source_group=p.add_mutually_exclusive_group(); source_group.add_argument("--single-source",default=None)
     source_group.add_argument("--pooled-source",action="store_true")
     p.add_argument("--output",default="artifacts/checkpoints/multisource.pt"); return p.parse_args()
@@ -89,6 +91,8 @@ def main():
         allow_hash_fallback=a.debug_hash_encoder,max_events=a.max_events,gmm_projection_dim=a.gmm_projection_dim,
         sequence_layers=a.sequence_layers,dora_rank=a.dora_rank,disable_parameters=a.disable_parameters,
         disable_gmm=a.disable_gmm).to(device)
+    if a.freeze_backbone and hasattr(model.text_encoder,"bert"):
+        for parameter in model.text_encoder.bert.parameters(): parameter.requires_grad=False
     model.fusion.set_trained_mask(torch.ones(len(systems),dtype=torch.bool,device=device))
     loader=DataLoader(train,batch_sampler=SystemBalancedBatchSampler(train_rows,a.batch_size,a.seed),collate_fn=collate_fn)
     validation_loader=DataLoader(validation,batch_size=a.batch_size,shuffle=False,collate_fn=collate_fn)

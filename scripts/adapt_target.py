@@ -11,7 +11,7 @@ if str(ROOT) not in sys.path: sys.path.insert(0,str(ROOT))
 from pa_moelog.data import LogDataset, LogSequenceDataset, collate_fn
 from pa_moelog.models import PAMoELog
 from pa_moelog.models.dora import DoRALinear
-from pa_moelog.utils import compute_binary_metrics, load_checkpoint, restore_checkpoint, save_checkpoint
+from pa_moelog.utils import load_checkpoint, restore_checkpoint, save_checkpoint, select_best_f1_threshold
 
 def parse_args():
     p=argparse.ArgumentParser(description="Few-shot target adaptation for PA-MoELog.")
@@ -19,6 +19,7 @@ def parse_args():
     p.add_argument("--base-checkpoint",required=True); p.add_argument("--target-system",required=True)
     p.add_argument("--batch-size",type=int,default=32); p.add_argument("--epochs",type=int,default=5)
     p.add_argument("--lr",type=float,default=5e-5); p.add_argument("--fusion-temperature",type=float,default=1.0)
+    p.add_argument("--seed",type=int,default=7)
     p.add_argument("--fusion-shrinkage",type=float,default=None)
     p.add_argument("--fusion",choices=["uniform","support-guided"],default="support-guided")
     p.add_argument("--adaptation",choices=["head-only","dora","full"],default="dora")
@@ -87,19 +88,23 @@ def tune_validation(model,loader,device):
     for batch in loader:
         out=forward(model,batch,device); labels.append(batch["labels"]); cls.append(out["classifier_score"].cpu()); energy.append(out["energy_score"].cpu())
     labels=torch.cat(labels); cls=torch.cat(cls); energy=torch.cat(energy)
-    best=(-1.0,0.7,0.3,0.5)
-    alphas=[1.0] if model.disable_gmm else [i/10 for i in range(11)]
+    best=(-1.0,0.7,0.3,0.5,0.0,0.0)
+    alphas=[1.0] if model.disable_gmm else [i/20 for i in range(21)]
     for alpha in alphas:
         scores=alpha*cls+(1-alpha)*energy
-        for threshold in [i/20 for i in range(1,20)]:
-            f1=compute_binary_metrics(labels,scores,threshold)["f1"]
-            if f1>best[0]: best=(f1,alpha,1-alpha,threshold)
+        operating_point=select_best_f1_threshold(labels,scores)
+        candidate=(operating_point["f1"],alpha,1-alpha,operating_point["threshold"],
+                   operating_point["precision"],operating_point["recall"])
+        if candidate[0]>best[0]: best=candidate
     model.alpha,model.beta=best[1],best[2]
-    print(f"[adapt] validation f1={best[0]:.4f} alpha={best[1]:.2f} beta={best[2]:.2f} threshold={best[3]:.2f}")
+    print(f"[adapt] validation f1={best[0]:.4f} precision={best[4]:.4f} recall={best[5]:.4f} "
+          f"alpha={best[1]:.2f} beta={best[2]:.2f} threshold={best[3]:.8f}")
     return best[3]
 
 def main():
-    a=parse_args(); device=torch.device(a.device); support=dataset(a.support_csv,a)
+    a=parse_args(); torch.manual_seed(a.seed)
+    if torch.cuda.is_available(): torch.cuda.manual_seed_all(a.seed)
+    device=torch.device(a.device); support=dataset(a.support_csv,a)
     loader=DataLoader(support,batch_size=a.batch_size,shuffle=False,collate_fn=collate_fn)
     base_metadata=load_checkpoint(a.base_checkpoint,map_location=device); base_config=base_metadata.get("config",{})
     if bool(base_config.get("sequence",False)) != bool(a.sequence):
