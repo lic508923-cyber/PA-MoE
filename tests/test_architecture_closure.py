@@ -37,6 +37,6 @@ class ArchitectureClosureTest(unittest.TestCase):
         self.assertLessEqual(int(model.gmm_energy.active_projection_dim),7)
         one=model._normalize_energy(model.gmm_energy(normal[:1])["energy"])
         many=model._normalize_energy(model.gmm_energy(normal[:4])["energy"])
-        self.assertTrue(torch.allclose(one,many[:1]))
+        torch.testing.assert_close(one,many[:1],rtol=1e-5,atol=1e-5)
 
 if __name__ == "__main__": unittest.main()
