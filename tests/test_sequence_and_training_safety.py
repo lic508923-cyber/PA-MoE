@@ -8,8 +8,9 @@ from pathlib import Path
 import torch
 from pa_moelog.data import LogSequenceDataset
 from pa_moelog.models import LightweightExpertFusion,PAMoELog,ParameterEncoder
+from pa_moelog.models.dora import DoRAWeightParametrization
 from pa_moelog.utils import compute_binary_metrics,load_checkpoint,save_checkpoint
-from scripts.adapt_target import set_adaptation_trainable
+from scripts.adapt_target import select_alpha_operating_point,set_adaptation_trainable
 from scripts.evaluate import validate_checkpoint_mode
 from scripts.train_multisource import SystemBalancedBatchSampler
 
@@ -148,6 +149,60 @@ class SequenceAndTrainingSafetyTest(unittest.TestCase):
             counts.append(sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad))
         self.assertLess(counts[0],counts[1]); self.assertLess(counts[1],counts[2])
 
+    def test_partial_adaptation_freezes_bert_but_trains_non_bert_heads(self):
+        model=PAMoELog(hidden_dim=16,num_experts=1,backbone_name="simple-hash-encoder")
+        # A small stand-in avoids downloading BERT while exercising the module boundary.
+        model.text_encoder.bert=torch.nn.Linear(16,16)
+        set_adaptation_trainable(model,"partial")
+        self.assertTrue(all(not parameter.requires_grad for parameter in model.text_encoder.bert.parameters()))
+        self.assertTrue(all(parameter.requires_grad for parameter in model.expert_pool.parameters()))
+        self.assertTrue(all(parameter.requires_grad for parameter in model.target_classifier.parameters()))
+
+    def test_expert_dora_trains_only_low_rank_gate_norm_and_classifier(self):
+        model=PAMoELog(hidden_dim=16,num_experts=2,backbone_name="simple-hash-encoder")
+        model.enable_expert_dora(rank=4,alpha=4); set_adaptation_trainable(model,"dora")
+        self.assertTrue(all(parameter.requires_grad for parameter in model.target_gate.parameters()))
+        self.assertTrue(all(parameter.requires_grad for parameter in model.target_norm.parameters()))
+        self.assertTrue(all(parameter.requires_grad for parameter in model.target_classifier.parameters()))
+        for expert in model.expert_pool.experts:
+            adapter=expert.target_projection
+            self.assertTrue(adapter.lora_a.requires_grad)
+            self.assertTrue(adapter.lora_b.requires_grad)
+            self.assertTrue(adapter.magnitude.requires_grad)
+            self.assertTrue(all(not parameter.requires_grad
+                                for parameter in adapter.base_linear.parameters()))
+            self.assertTrue(all(not parameter.requires_grad
+                                for parameter in expert.projection.parameters()))
+
+    def test_deep_dora_freezes_bases_and_large_value_embedding(self):
+        model=PAMoELog(hidden_dim=16,num_experts=2,backbone_name="simple-hash-encoder")
+        model.enable_deep_dora(rank=4,alpha=4); set_adaptation_trainable(model,"deep-dora")
+        self.assertTrue(model.target_gate.projection.weight.requires_grad)
+        self.assertTrue(model.event_position_embedding.weight.requires_grad)
+        self.assertTrue(model.parameter_encoder.type_embedding.weight.requires_grad)
+        self.assertFalse(model.parameter_encoder.value_embedding.weight.requires_grad)
+        originals=[parameter for name,parameter in model.named_parameters()
+                   if ".parametrizations." in name and name.endswith(".original")]
+        self.assertTrue(originals)
+        self.assertTrue(all(not parameter.requires_grad for parameter in originals))
+
+    def test_alpha_ties_use_preregistered_prior_instead_of_first_low_alpha(self):
+        labels=torch.tensor([0.,0.,1.,1.]); scores=torch.tensor([.1,.2,.8,.9])
+        selected=select_alpha_operating_point(labels,scores,scores,alpha_prior=.7,
+                                              alphas=[0.,.5,.7,1.])
+        self.assertEqual(selected["alpha"],.7)
+        self.assertEqual(selected["f1_tied_alphas"],[0.,.5,.7,1.])
+        self.assertEqual(selected["auprc_tied_alphas"],[0.,.5,.7,1.])
+
+    def test_alpha_f1_ties_use_continuous_auprc_before_prior(self):
+        labels=torch.tensor([1.,0.,1.,0.])
+        classifier=torch.tensor([.9,.8,.7,.1])  # positive ranks 1 and 3
+        energy=torch.tensor([.8,.9,.7,.1])      # positive ranks 2 and 3
+        selected=select_alpha_operating_point(labels,classifier,energy,alpha_prior=0.,alphas=[0.,1.])
+        self.assertEqual(selected["f1_tied_alphas"],[0.,1.])
+        self.assertEqual(selected["alpha"],1.)
+        self.assertGreater(selected["auprc"],selected["candidates"][0]["auprc"])
+
     def test_fpr_and_fpr_at_fixed_recall(self):
         metrics=compute_binary_metrics([0,0,1,1],[0.9,0.1,0.8,0.7],threshold=.5,fixed_recall=1.0)
         self.assertEqual(metrics["fpr"],.5)
@@ -179,6 +234,56 @@ class SequenceAndTrainingSafetyTest(unittest.TestCase):
             self.assertLess(efficiency["trainable_parameter_ratio"],1)
             self.assertEqual(efficiency["checkpoint_size_bytes"],(output/"T_adapted.pt").stat().st_size)
 
+    def test_expert_dora_adaptation_is_enabled_end_to_end(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); base=root/"base.pt"; support=root/"support.csv"; output=root/"adapted"
+            model=PAMoELog(hidden_dim=8,num_experts=2,backbone_name="simple-hash-encoder")
+            save_checkpoint(base,model,{"hidden_dim":8,"num_experts":2,"sequence":False,
+                            "backbone_name":"simple-hash-encoder","disable_parameters":False,"disable_gmm":False},
+                            extra={"hidden_dim":8,"num_experts":2,"source_normal_prototypes":torch.randn(2,8),
+                                   "trained_expert_mask":torch.ones(2,dtype=torch.bool)})
+            with support.open("w",encoding="utf-8",newline="") as handle:
+                writer=csv.DictWriter(handle,fieldnames=["log","label","system"]); writer.writeheader()
+                for index,label in enumerate((0,0,1,1)):
+                    writer.writerow({"log":f"target event {index}","label":label,"system":"T"})
+            script=Path(__file__).resolve().parents[1]/"scripts"/"adapt_target.py"
+            subprocess.run([sys.executable,str(script),"--support-csv",str(support),"--base-checkpoint",str(base),
+                            "--target-system","T","--output-dir",str(output),"--epochs","1",
+                            "--fusion","uniform","--adaptation","dora","--disable-gmm",
+                            "--debug-hash-encoder"],cwd=root,check=True,capture_output=True,text=True)
+            checkpoint=load_checkpoint(output/"T_adapted.pt")
+            self.assertTrue(checkpoint["config"]["expert_dora_enabled"])
+            self.assertEqual(checkpoint["config"]["dora_alpha"],4)
+            self.assertTrue(checkpoint["model_signature"]["expert_dora_enabled"])
+            keys=set(checkpoint["model_state_dict"])
+            self.assertTrue(any(key.startswith("target_gate.") for key in keys))
+            self.assertTrue(any("target_projection.lora_a" in key for key in keys))
+
+    def test_deep_dora_adaptation_is_enabled_end_to_end(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); base=root/"base.pt"; support=root/"support.csv"; output=root/"adapted"
+            model=PAMoELog(hidden_dim=8,num_experts=2,backbone_name="simple-hash-encoder")
+            save_checkpoint(base,model,{"hidden_dim":8,"num_experts":2,"sequence":False,
+                            "backbone_name":"simple-hash-encoder","disable_parameters":False,"disable_gmm":False},
+                            extra={"hidden_dim":8,"num_experts":2,"source_normal_prototypes":torch.randn(2,8),
+                                   "trained_expert_mask":torch.ones(2,dtype=torch.bool)})
+            with support.open("w",encoding="utf-8",newline="") as handle:
+                writer=csv.DictWriter(handle,fieldnames=["log","label","system"]); writer.writeheader()
+                for index,label in enumerate((0,0,1,1)):
+                    writer.writerow({"log":f"target event {index}","label":label,"system":"T"})
+            script=Path(__file__).resolve().parents[1]/"scripts"/"adapt_target.py"
+            subprocess.run([sys.executable,str(script),"--support-csv",str(support),"--base-checkpoint",str(base),
+                            "--target-system","T","--output-dir",str(output),"--epochs","1",
+                            "--fusion","uniform","--adaptation","deep-dora","--deep-dora-rank","4",
+                            "--disable-gmm","--debug-hash-encoder"],cwd=root,check=True,
+                           capture_output=True,text=True)
+            checkpoint=load_checkpoint(output/"T_adapted.pt")
+            self.assertTrue(checkpoint["config"]["deep_dora_enabled"])
+            self.assertEqual(checkpoint["config"]["deep_dora_rank"],4)
+            self.assertTrue(checkpoint["model_signature"]["deep_dora_enabled"])
+            self.assertTrue(any("parametrizations" in key and "lora_a" in key
+                                for key in checkpoint["model_state_dict"]))
+
     def test_checkpoint_loading_is_strict(self):
         with tempfile.TemporaryDirectory() as directory:
             path=Path(directory)/"model.pt"; model=PAMoELog(hidden_dim=16,num_experts=1,backbone_name="simple-hash-encoder")
@@ -196,6 +301,36 @@ class SequenceAndTrainingSafetyTest(unittest.TestCase):
             load_checkpoint(path,model=restored)
             with torch.no_grad(): actual=restored(["service start"],[EMPTY])["logit"]
             self.assertTrue(torch.equal(expected,actual))
+
+    def test_expert_dora_checkpoint_roundtrip_is_strict(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory)/"expert_dora.pt"; torch.manual_seed(21)
+            model=PAMoELog(hidden_dim=16,num_experts=2,backbone_name="simple-hash-encoder")
+            model.enable_expert_dora(rank=4,alpha=4); model.eval()
+            with torch.no_grad(): expected=model(["service start"],[EMPTY])
+            save_checkpoint(path,model,{"sequence":False,"expert_dora_enabled":True,
+                                       "dora_alpha":4})
+            restored=PAMoELog(hidden_dim=16,num_experts=2,backbone_name="simple-hash-encoder",
+                              expert_dora_enabled=True,dora_rank=4,dora_alpha=4); restored.eval()
+            load_checkpoint(path,model=restored)
+            with torch.no_grad(): actual=restored(["service start"],[EMPTY])
+            torch.testing.assert_close(actual["logit"],expected["logit"])
+            torch.testing.assert_close(actual["fusion_weights"],expected["fusion_weights"])
+
+    def test_deep_dora_checkpoint_roundtrip_is_strict(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory)/"deep_dora.pt"; torch.manual_seed(22)
+            model=PAMoELog(hidden_dim=16,num_experts=2,backbone_name="simple-hash-encoder")
+            model.enable_deep_dora(rank=4,alpha=4); model.eval()
+            with torch.no_grad(): expected=model(["service start"],[EMPTY])
+            save_checkpoint(path,model,{"sequence":False,"deep_dora_enabled":True,
+                                       "deep_dora_rank":4,"deep_dora_alpha":4})
+            restored=PAMoELog(hidden_dim=16,num_experts=2,backbone_name="simple-hash-encoder",
+                              deep_dora_enabled=True,deep_dora_rank=4,deep_dora_alpha=4); restored.eval()
+            load_checkpoint(path,model=restored)
+            with torch.no_grad(): actual=restored(["service start"],[EMPTY])
+            torch.testing.assert_close(actual["logit"],expected["logit"])
+            torch.testing.assert_close(actual["fusion_weights"],expected["fusion_weights"])
 
     def test_whole_model_is_batch_invariant(self):
         torch.manual_seed(13); model=PAMoELog(hidden_dim=16,num_experts=1,backbone_name="simple-hash-encoder"); model.eval()

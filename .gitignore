@@ -1,6 +1,7 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.test-tmp*/
 .mypy_cache/
 .ruff_cache/
 .venv/
@@ -12,5 +13,6 @@ build/
 checkpoints/
 outputs/
 artifacts/
+data/raw/
 data/processed/
 .vscode/

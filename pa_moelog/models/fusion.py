@@ -55,3 +55,24 @@ class LightweightExpertFusion(nn.Module):
 
     def forward(self, batch_size: int, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
         return self.weights.to(device=device, dtype=dtype).unsqueeze(0).expand(batch_size, -1)
+
+
+class TargetConditionedExpertGate(nn.Module):
+    """Learn per-sample expert weights around a calibrated static prior."""
+
+    def __init__(self, hidden_dim: int, num_experts: int) -> None:
+        super().__init__()
+        self.num_experts = num_experts
+        self.projection = nn.Linear(hidden_dim, num_experts)
+        nn.init.zeros_(self.projection.weight)
+        nn.init.zeros_(self.projection.bias)
+
+    def forward(self, shared_hidden: torch.Tensor, prior: torch.Tensor,
+                trained_mask: torch.Tensor) -> torch.Tensor:
+        if prior.shape != (self.num_experts,) or trained_mask.shape != (self.num_experts,):
+            raise ValueError("gate prior and mask must match num_experts")
+        prior = prior.to(device=shared_hidden.device, dtype=shared_hidden.dtype).clamp_min(1e-8)
+        mask = trained_mask.to(device=shared_hidden.device, dtype=torch.bool)
+        logits = self.projection(shared_hidden) + prior.log().unsqueeze(0)
+        logits = logits.masked_fill(~mask.unsqueeze(0), float("-inf"))
+        return torch.softmax(logits, dim=-1)

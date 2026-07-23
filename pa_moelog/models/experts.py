@@ -5,6 +5,8 @@ from __future__ import annotations
 import torch
 from torch import nn
 
+from .dora import DoRALinear
+
 
 class LogExpert(nn.Module):
     """A small domain branch; parameter-aware encoding is shared upstream."""
@@ -20,9 +22,44 @@ class LogExpert(nn.Module):
             nn.LayerNorm(hidden_dim),
         )
         self.classifier = nn.Linear(hidden_dim, 1)
+        self.target_projection: DoRALinear | None = None
+
+    def enable_target_dora(self, rank: int = 4, alpha: float | None = None) -> None:
+        """Attach DoRA to the expert's trained output projection.
+
+        The zero-initialized low-rank branch exactly preserves the source expert
+        at activation time; target adaptation then learns only direction and
+        magnitude changes around that trained source-domain weight.
+        """
+        source = self.projection[3]
+        if not isinstance(source, nn.Linear):
+            raise TypeError("expert output projection must be linear")
+        adapter = DoRALinear(source.in_features, source.out_features, rank=rank,
+                             bias=source.bias is not None,
+                             alpha=float(rank if alpha is None else alpha)).to(
+                                 device=source.weight.device, dtype=source.weight.dtype)
+        adapter.load_base_from_linear(source)
+        self.target_projection = adapter
+
+    def _hidden(self, shared_hidden: torch.Tensor, *, target_adapted: bool) -> torch.Tensor:
+        hidden = self.projection[0](shared_hidden)
+        hidden = self.projection[1](hidden)
+        hidden = self.projection[2](hidden)
+        if target_adapted:
+            if self.target_projection is None:
+                raise RuntimeError("target DoRA has not been enabled")
+            hidden = self.target_projection(hidden)
+        else:
+            hidden = self.projection[3](hidden)
+        return self.projection[4](hidden)
 
     def forward(self, shared_hidden: torch.Tensor) -> dict:
-        hidden = self.projection(shared_hidden)
+        hidden = self._hidden(shared_hidden, target_adapted=False)
+        logit = self.classifier(hidden).squeeze(-1)
+        return {"logit": logit, "prob": torch.sigmoid(logit), "hidden": hidden}
+
+    def forward_target(self, shared_hidden: torch.Tensor) -> dict:
+        hidden = self._hidden(shared_hidden, target_adapted=True)
         logit = self.classifier(hidden).squeeze(-1)
         return {"logit": logit, "prob": torch.sigmoid(logit), "hidden": hidden}
 
@@ -36,10 +73,16 @@ class ExpertPool(nn.Module):
             [LogExpert(hidden_dim=hidden_dim, rank=rank, dropout=dropout) for _ in range(num_experts)]
         )
 
-    def forward(self, shared_hidden: torch.Tensor, fusion_weights: torch.Tensor) -> dict:
+    def enable_target_dora(self, rank: int = 4, alpha: float | None = None) -> None:
+        for expert in self.experts:
+            expert.enable_target_dora(rank=rank, alpha=alpha)
+
+    def forward(self, shared_hidden: torch.Tensor, fusion_weights: torch.Tensor,
+                *, target_adapted: bool = False) -> dict:
         if fusion_weights.shape != (shared_hidden.size(0), len(self.experts)):
             raise ValueError("fusion_weights must have shape [batch, num_experts]")
-        outputs = [expert(shared_hidden) for expert in self.experts]
+        outputs = [(expert.forward_target(shared_hidden) if target_adapted else expert(shared_hidden))
+                   for expert in self.experts]
         probs = torch.stack([item["prob"] for item in outputs], dim=-1)
         logits = torch.stack([item["logit"] for item in outputs], dim=-1)
         hiddens = torch.stack([item["hidden"] for item in outputs], dim=1)

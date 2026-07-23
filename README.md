@@ -137,9 +137,38 @@ model code:
 train_multisource.py: --disable-parameters --disable-gmm
                       --single-source SYSTEM | --pooled-source
 adapt_target.py:      --fusion uniform|support-guided
-                      --adaptation head-only|dora|full
+                       --adaptation head-only|dora|deep-dora|partial|full
+                       --dora-alpha VALUE
+                       --deep-dora-rank 8 --deep-dora-alpha 8
+                      --alpha-prior 0.7
+                      --alpha-f1-tolerance 1e-12
+                      --alpha-auprc-tolerance 1e-12
                       --disable-gmm
 ```
+
+`dora` attaches a separate DoRA projection to the trained output projection of
+every source expert. The zero-initialized low-rank branches preserve all source
+expert outputs at activation time. A target-conditioned gate starts from the
+support-calibrated static expert prior and then learns per-sample expert weights.
+The default DoRA scaling uses `alpha=rank` (unit `alpha/rank` scale); use
+`--dora-alpha` only for a preregistered scaling ablation. Legacy source
+checkpoints remain loadable because these target-only modules are created after
+the source checkpoint is restored.
+
+`deep-dora` extends the same source-preserving parameterization to the trained
+non-BERT task path: the BERT output projection, parameter-fusion attention/FFN,
+sequence Transformer attention/FFN, and both projections plus classifier in
+each source expert. It also trains small non-BERT LayerNorm, event-position,
+parameter-type, target-gate and target-classifier state, while freezing BERT,
+all original weight matrices and the large parameter-value embedding. This is
+the parameter-efficient counterpart to `partial` for larger domain shifts.
+
+`partial` freezes the pretrained BERT module while adapting the target branch
+and all non-BERT task heads. Alpha selection first maximizes validation F1,
+then resolves F1 ties by validation AUPRC, and uses the preregistered prior only
+when both metrics remain tied within their configured tolerances. The adaptation
+log reports all tied alphas plus classifier-only and GMM-only validation F1; the
+prior does not impose an alpha floor.
 
 `--disable-parameters` changes the source model architecture and must therefore
 be selected during source training. Target adaptation verifies that its setting

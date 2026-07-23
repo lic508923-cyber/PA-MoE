@@ -8,10 +8,11 @@ from typing import Dict, List
 
 import torch
 from torch import nn
+from torch.nn.utils import parametrize
 
-from .dora import DoRALinear
+from .dora import DoRALinear, DoRAWeightParametrization
 from .experts import ExpertPool
-from .fusion import LightweightExpertFusion
+from .fusion import LightweightExpertFusion, TargetConditionedExpertGate
 from .gmm_energy import GMMEnergy
 from .parameter_attention import ParameterAwareEncoder, ParameterEncoder
 
@@ -100,7 +101,9 @@ class PAMoELog(nn.Module):
         alpha=0.7, beta=0.3, backbone_name="bert-base-uncased",
         max_length=32, allow_hash_fallback=False, sequence_layers=1,
         max_events=512, gmm_projection_dim=32, fusion_shrinkage_strength=16.0, dora_rank=4,
-        disable_parameters=False, disable_gmm=False,
+        disable_parameters=False, disable_gmm=False, expert_dora_enabled=False,
+        dora_alpha=None, deep_dora_enabled=False, deep_dora_rank=8,
+        deep_dora_alpha=None,
     ) -> None:
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -112,6 +115,11 @@ class PAMoELog(nn.Module):
         self.sequence_layers = sequence_layers
         self.disable_parameters = disable_parameters
         self.disable_gmm = disable_gmm
+        self.expert_dora_enabled = bool(expert_dora_enabled)
+        self.dora_alpha = float(dora_rank if dora_alpha is None else dora_alpha)
+        self.deep_dora_enabled = bool(deep_dora_enabled)
+        self.deep_dora_rank = int(deep_dora_rank)
+        self.deep_dora_alpha = float(deep_dora_rank if deep_dora_alpha is None else deep_dora_alpha)
         self.text_encoder, self.backbone_name = build_text_encoder(
             hidden_dim, backbone_name, max_length, allow_hash_fallback
         )
@@ -129,16 +137,21 @@ class PAMoELog(nn.Module):
         # 静态融合默认均匀利用全部专家，也可由目标支持集一次性校准。
         self.fusion = LightweightExpertFusion(num_experts, shrinkage_strength=fusion_shrinkage_strength)
         self.expert_pool = ExpertPool(num_experts, hidden_dim)
+        self.target_gate: TargetConditionedExpertGate | None = None
         # 共享 DoRA 位于专家融合之后，是目标域主要的可训练适配参数。
         self.target_adapter = DoRALinear(hidden_dim, hidden_dim, rank=dora_rank)
         self.target_norm = nn.LayerNorm(hidden_dim)
         self.target_classifier = nn.Linear(hidden_dim, 1)
         nn.init.zeros_(self.target_classifier.weight)
         nn.init.zeros_(self.target_classifier.bias)
+        if self.expert_dora_enabled:
+            self.enable_expert_dora(rank=dora_rank, alpha=self.dora_alpha)
         self.gmm_energy = GMMEnergy(hidden_dim, num_gmm_components, projection_dim=gmm_projection_dim)
         self.register_buffer("energy_location", torch.tensor(0.0))
         self.register_buffer("energy_scale", torch.tensor(1.0))
         self.register_buffer("energy_stats_fitted", torch.tensor(False))
+        if self.deep_dora_enabled:
+            self.enable_deep_dora(rank=self.deep_dora_rank, alpha=self.deep_dora_alpha)
 
     def encode_events(self, semantic_texts, parameters) -> torch.Tensor:
         text_embeddings, text_mask = self.text_encoder(semantic_texts)
@@ -155,7 +168,7 @@ class PAMoELog(nn.Module):
         )
 
     def checkpoint_signature(self) -> dict:
-        return {
+        signature = {
             "backbone_name": self.backbone_name,
             "hidden_dim": self.hidden_dim,
             "num_experts": self.num_experts,
@@ -166,6 +179,63 @@ class PAMoELog(nn.Module):
             "disable_parameters": self.disable_parameters,
             "disable_gmm": self.disable_gmm,
         }
+        # Keep legacy/source signatures byte-for-byte compatible.  New fields
+        # are present only in target checkpoints that actually own the modules.
+        if self.expert_dora_enabled:
+            signature.update({"expert_dora_enabled": True, "dora_alpha": self.dora_alpha})
+        if self.deep_dora_enabled:
+            signature.update({"deep_dora_enabled": True, "deep_dora_rank": self.deep_dora_rank,
+                              "deep_dora_alpha": self.deep_dora_alpha})
+        return signature
+
+    def _ensure_target_gate(self) -> None:
+        if self.target_gate is None:
+            self.target_gate = TargetConditionedExpertGate(self.hidden_dim, self.num_experts).to(
+                device=self.fusion.weights.device, dtype=self.target_classifier.weight.dtype)
+
+    def enable_expert_dora(self, rank: int | None = None, alpha: float | None = None) -> None:
+        rank = int(self.target_adapter.rank if rank is None else rank)
+        self.dora_alpha = float(rank if alpha is None else alpha)
+        self.expert_pool.enable_target_dora(rank=rank, alpha=self.dora_alpha)
+        self._ensure_target_gate()
+        self.expert_dora_enabled = True
+
+    @staticmethod
+    def _register_weight_dora(module: nn.Module, name: str, rank: int, alpha: float) -> None:
+        if parametrize.is_parametrized(module, name):
+            raise RuntimeError(f"{module.__class__.__name__}.{name} is already parametrized")
+        weight = getattr(module, name)
+        parametrize.register_parametrization(
+            module, name, DoRAWeightParametrization(weight.detach(), rank=rank, alpha=alpha)
+        )
+        getattr(module.parametrizations, name).original.requires_grad = False
+
+    def enable_deep_dora(self, rank: int = 8, alpha: float | None = None) -> None:
+        """Attach DoRA throughout the trained non-BERT task backbone."""
+        rank = int(rank); alpha = float(rank if alpha is None else alpha)
+        if rank < 1:
+            raise ValueError("deep DoRA rank must be positive")
+        targets: list[tuple[nn.Module, str]] = []
+        projection = getattr(self.text_encoder, "projection", None)
+        if isinstance(projection, nn.Linear):
+            targets.append((projection, "weight"))
+        cross_attention = self.fusion_encoder.attention.attention
+        targets.extend([(cross_attention, "in_proj_weight"), (cross_attention.out_proj, "weight"),
+                        (self.fusion_encoder.ffn[0], "weight"),
+                        (self.fusion_encoder.ffn[3], "weight")])
+        for layer in self.sequence_encoder.layers:
+            targets.extend([(layer.self_attn, "in_proj_weight"),
+                            (layer.self_attn.out_proj, "weight"),
+                            (layer.linear1, "weight"), (layer.linear2, "weight")])
+        for expert in self.expert_pool.experts:
+            targets.extend([(expert.projection[0], "weight"),
+                            (expert.projection[3], "weight"),
+                            (expert.classifier, "weight")])
+        for module, name in targets:
+            self._register_weight_dora(module, name, rank, alpha)
+        self._ensure_target_gate()
+        self.deep_dora_rank, self.deep_dora_alpha = rank, alpha
+        self.deep_dora_enabled = True
 
     def encode_sequences(self, semantic_sequences, parameter_sequences, event_mask=None) -> torch.Tensor:
         lengths = [len(sequence) for sequence in semantic_sequences]
@@ -205,11 +275,16 @@ class PAMoELog(nn.Module):
             shared_hidden = self.encode_sequences(
                 [[text] for text in semantic_texts], [[item] for item in parameters]
             )
-        fusion_weights = self.fusion(
+        static_weights = self.fusion(
             shared_hidden.size(0), device=shared_hidden.device, dtype=shared_hidden.dtype
         )
-        expert_output = self.expert_pool(shared_hidden, fusion_weights)
-        target_hidden = self.target_norm(self.target_adapter(expert_output["hidden"]))
+        use_target_gate = self.expert_dora_enabled or self.deep_dora_enabled
+        fusion_weights = (self.target_gate(shared_hidden, self.fusion.weights, self.fusion.trained_mask)
+                          if use_target_gate else static_weights)
+        expert_output = self.expert_pool(shared_hidden, fusion_weights,
+                                         target_adapted=self.expert_dora_enabled)
+        target_hidden = self.target_norm(expert_output["hidden"] if use_target_gate
+                                         else self.target_adapter(expert_output["hidden"]))
         target_logit = expert_output["combined_logit"] + self.target_classifier(target_hidden).squeeze(-1)
         classifier_score = torch.sigmoid(target_logit)
         raw_energy = self.gmm_energy(target_hidden)["energy"]

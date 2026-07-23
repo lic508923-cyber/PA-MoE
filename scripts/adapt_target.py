@@ -10,8 +10,9 @@ ROOT=Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path: sys.path.insert(0,str(ROOT))
 from pa_moelog.data import LogDataset, LogSequenceDataset, collate_fn
 from pa_moelog.models import PAMoELog
-from pa_moelog.models.dora import DoRALinear
-from pa_moelog.utils import load_checkpoint, restore_checkpoint, save_checkpoint, select_best_f1_threshold
+from pa_moelog.models.dora import DoRALinear, DoRAWeightParametrization
+from pa_moelog.utils import (compute_binary_metrics, load_checkpoint, restore_checkpoint,
+                             save_checkpoint, select_best_f1_threshold)
 
 def parse_args():
     p=argparse.ArgumentParser(description="Few-shot target adaptation for PA-MoELog.")
@@ -22,7 +23,16 @@ def parse_args():
     p.add_argument("--seed",type=int,default=7)
     p.add_argument("--fusion-shrinkage",type=float,default=None)
     p.add_argument("--fusion",choices=["uniform","support-guided"],default="support-guided")
-    p.add_argument("--adaptation",choices=["head-only","dora","full"],default="dora")
+    p.add_argument("--adaptation",choices=["head-only","dora","deep-dora","partial","full"],default="dora")
+    p.add_argument("--dora-alpha",type=float,default=None,
+                   help="Expert DoRA scaling alpha; defaults to rank so alpha/rank is 1.")
+    p.add_argument("--deep-dora-rank",type=int,default=8)
+    p.add_argument("--deep-dora-alpha",type=float,default=None,
+                   help="Deep-DoRA scaling alpha; defaults to its rank.")
+    p.add_argument("--alpha-prior",type=float,default=.7,
+                   help="Preregistered alpha used only after validation F1 and AUPRC ties.")
+    p.add_argument("--alpha-f1-tolerance",type=float,default=1e-12)
+    p.add_argument("--alpha-auprc-tolerance",type=float,default=1e-12)
     p.add_argument("--disable-parameters",action=argparse.BooleanOptionalAction,default=None)
     p.add_argument("--disable-gmm",action=argparse.BooleanOptionalAction,default=None)
     p.add_argument("--output-dir",default="artifacts/checkpoints/target_adapt"); p.add_argument("--device",default="cpu")
@@ -41,6 +51,11 @@ def load_model(path,device,backbone=None,allow=False,checkpoint=None):
         max_events=int(cfg.get("max_events",512)),gmm_projection_dim=int(cfg.get("gmm_projection_dim",32)),
         fusion_shrinkage_strength=float(cfg.get("fusion_shrinkage_strength",16.0)),
         sequence_layers=int(cfg.get("sequence_layers",1)),dora_rank=int(cfg.get("dora_rank",4)),
+        expert_dora_enabled=bool(cfg.get("expert_dora_enabled",False)),
+        dora_alpha=cfg.get("dora_alpha"),
+        deep_dora_enabled=bool(cfg.get("deep_dora_enabled",False)),
+        deep_dora_rank=int(cfg.get("deep_dora_rank",8)),
+        deep_dora_alpha=cfg.get("deep_dora_alpha"),
         disable_parameters=bool(cfg.get("disable_parameters",False)),disable_gmm=bool(cfg.get("disable_gmm",False))).to(device)
     restore_checkpoint(ck,model,strict=True)
     if "trained_expert_mask" in ck: model.fusion.set_trained_mask(ck["trained_expert_mask"].to(device))
@@ -49,14 +64,51 @@ def load_model(path,device,backbone=None,allow=False,checkpoint=None):
 def set_adaptation_trainable(model,mode):
     for p in model.parameters(): p.requires_grad=False
     for p in model.target_classifier.parameters(): p.requires_grad=True
-    if mode in {"dora","full"}:
+    if mode in {"dora","deep-dora","full"}:
         for p in model.target_norm.parameters(): p.requires_grad=True
     if mode=="dora":
-        for module in model.target_adapter.modules():
-            if isinstance(module,DoRALinear):
+        if model.expert_dora_enabled:
+            if model.target_gate is None:
+                raise RuntimeError("expert DoRA requires the target-conditioned gate")
+            for p in model.target_gate.parameters(): p.requires_grad=True
+            for expert in model.expert_pool.experts:
+                module=expert.target_projection
+                if not isinstance(module,DoRALinear):
+                    raise RuntimeError("expert DoRA projection is missing")
                 module.lora_a.requires_grad=True; module.lora_b.requires_grad=True; module.magnitude.requires_grad=True
+        else:
+            # Compatibility path for target checkpoints created before the
+            # expert-level DoRA redesign.
+            for module in model.target_adapter.modules():
+                if isinstance(module,DoRALinear):
+                    module.lora_a.requires_grad=True; module.lora_b.requires_grad=True; module.magnitude.requires_grad=True
+    if mode=="deep-dora":
+        if not model.deep_dora_enabled or model.target_gate is None:
+            raise RuntimeError("deep-dora modules have not been enabled")
+        for module in model.modules():
+            if isinstance(module,DoRAWeightParametrization):
+                module.lora_a.requires_grad=True
+                module.lora_b.requires_grad=True
+                module.magnitude.requires_grad=True
+        for p in model.target_gate.parameters(): p.requires_grad=True
+        # Small task-specific state complements the low-rank weight updates;
+        # the large value embedding and every BERT parameter remain frozen.
+        for name,module in model.named_modules():
+            if isinstance(module,nn.LayerNorm) and not name.startswith("text_encoder.bert"):
+                for p in module.parameters(): p.requires_grad=True
+        for p in model.event_position_embedding.parameters(): p.requires_grad=True
+        for p in model.parameter_encoder.type_embedding.parameters(): p.requires_grad=True
+        model.fusion_encoder.gate.requires_grad=True
     if mode=="full":
         for p in model.parameters(): p.requires_grad=True
+    if mode=="partial":
+        # Adapt every task-specific/non-BERT module while preserving the pretrained
+        # language backbone.  This is distinct from DoRA, which only updates the
+        # target adapter, normalization and classifier.
+        for p in model.parameters(): p.requires_grad=True
+        bert=getattr(model.text_encoder,"bert",None)
+        if bert is not None:
+            for p in bert.parameters(): p.requires_grad=False
 
 def forward(model,batch,device):
     return model(batch["semantic_texts"],batch["parameters"],batch["event_mask"].to(device))
@@ -82,24 +134,51 @@ def collect_normal_hidden(model,loader,device):
         if bool((labels==0).any()): result.append(out["target_hidden"][labels==0])
     return torch.cat(result) if result else None
 
+def select_alpha_operating_point(labels,cls,energy,*,alpha_prior=.7,f1_tolerance=1e-12,
+                                 auprc_tolerance=1e-12,alphas=None):
+    if not 0.0<=alpha_prior<=1.0: raise ValueError("alpha_prior must be in [0, 1]")
+    if f1_tolerance<0 or auprc_tolerance<0: raise ValueError("alpha tolerances cannot be negative")
+    alphas=list(alphas if alphas is not None else [i/20 for i in range(21)])
+    if not alphas or any(alpha<0 or alpha>1 for alpha in alphas):
+        raise ValueError("alphas must be a non-empty sequence in [0, 1]")
+    candidates=[]
+    for alpha in alphas:
+        scores=alpha*cls+(1-alpha)*energy
+        operating_point=select_best_f1_threshold(labels,scores)
+        auprc=compute_binary_metrics(labels,scores)["auprc"]
+        candidates.append({**operating_point,"alpha":float(alpha),"beta":float(1-alpha),
+                           "auprc":float(auprc) if auprc is not None else -1.0})
+    max_f1=max(item["f1"] for item in candidates)
+    f1_ties=[item for item in candidates if max_f1-item["f1"]<=f1_tolerance]
+    max_auprc=max(item["auprc"] for item in f1_ties)
+    auprc_ties=[item for item in f1_ties if max_auprc-item["auprc"]<=auprc_tolerance]
+    # The prior is deliberately the last tie-break. It never overrides measurable
+    # validation evidence and therefore cannot impose an artificial alpha floor.
+    best=min(auprc_ties,key=lambda item:(abs(item["alpha"]-alpha_prior),-item["alpha"]))
+    return {**best,"f1_tied_alphas":[item["alpha"] for item in f1_ties],
+            "auprc_tied_alphas":[item["alpha"] for item in auprc_ties],"candidates":candidates}
+
 @torch.no_grad()
-def tune_validation(model,loader,device):
+def tune_validation(model,loader,device,*,alpha_prior=.7,f1_tolerance=1e-12,auprc_tolerance=1e-12):
     labels=[]; cls=[]; energy=[]
     for batch in loader:
         out=forward(model,batch,device); labels.append(batch["labels"]); cls.append(out["classifier_score"].cpu()); energy.append(out["energy_score"].cpu())
     labels=torch.cat(labels); cls=torch.cat(cls); energy=torch.cat(energy)
-    best=(-1.0,0.7,0.3,0.5,0.0,0.0)
     alphas=[1.0] if model.disable_gmm else [i/20 for i in range(21)]
-    for alpha in alphas:
-        scores=alpha*cls+(1-alpha)*energy
-        operating_point=select_best_f1_threshold(labels,scores)
-        candidate=(operating_point["f1"],alpha,1-alpha,operating_point["threshold"],
-                   operating_point["precision"],operating_point["recall"])
-        if candidate[0]>best[0]: best=candidate
-    model.alpha,model.beta=best[1],best[2]
-    print(f"[adapt] validation f1={best[0]:.4f} precision={best[4]:.4f} recall={best[5]:.4f} "
-          f"alpha={best[1]:.2f} beta={best[2]:.2f} threshold={best[3]:.8f}")
-    return best[3]
+    best=select_alpha_operating_point(labels,cls,energy,alpha_prior=alpha_prior,
+        f1_tolerance=f1_tolerance,auprc_tolerance=auprc_tolerance,alphas=alphas)
+    model.alpha,model.beta=best["alpha"],best["beta"]
+    by_alpha={item["alpha"]:item for item in best["candidates"]}
+    classifier=by_alpha[1.0]
+    gmm=by_alpha.get(0.0)
+    baseline=f"classifier_only_f1={classifier['f1']:.4f}"
+    if gmm is not None: baseline+=f" gmm_only_f1={gmm['f1']:.4f}"
+    print(f"[adapt] validation f1={best['f1']:.4f} auprc={best['auprc']:.4f} "
+          f"precision={best['precision']:.4f} recall={best['recall']:.4f} alpha={best['alpha']:.2f} "
+          f"beta={best['beta']:.2f} threshold={best['threshold']:.8f} {baseline}")
+    print(f"[adapt] alpha f1_ties={best['f1_tied_alphas']} auprc_ties={best['auprc_tied_alphas']} "
+          f"preregistered_prior={alpha_prior:.2f}")
+    return best
 
 def main():
     a=parse_args(); torch.manual_seed(a.seed)
@@ -118,6 +197,10 @@ def main():
         raise ValueError("--disable-parameters must match the source checkpoint; retrain the source ablation")
     model.disable_parameters=source_disable_parameters
     model.disable_gmm=bool(base_config.get("disable_gmm",False) if a.disable_gmm is None else a.disable_gmm)
+    if a.adaptation=="dora" and not model.expert_dora_enabled:
+        model.enable_expert_dora(rank=model.target_adapter.rank,alpha=a.dora_alpha)
+    if a.adaptation=="deep-dora" and not model.deep_dora_enabled:
+        model.enable_deep_dora(rank=a.deep_dora_rank,alpha=a.deep_dora_alpha)
     adaptation_start=time.perf_counter()
     if device.type=="cuda": torch.cuda.reset_peak_memory_stats(device)
     if a.fusion_shrinkage is not None: model.fusion.shrinkage_strength=float(a.fusion_shrinkage)
@@ -146,19 +229,25 @@ def main():
         normal=collect_normal_hidden(model,loader,device)
         if normal is None or normal.size(0)<2: raise ValueError("at least two normal support samples are required to fit GMM")
         model.gmm_energy.fit_normal(normal); model.fit_energy_statistics(normal)
-    threshold=0.5
+    threshold=0.5; validation_selection=None
     if a.validation_csv:
-        threshold=tune_validation(model,DataLoader(dataset(a.validation_csv,a),batch_size=a.batch_size,shuffle=False,collate_fn=collate_fn),device)
+        validation_selection=tune_validation(model,DataLoader(dataset(a.validation_csv,a),batch_size=a.batch_size,shuffle=False,collate_fn=collate_fn),device,
+            alpha_prior=a.alpha_prior,f1_tolerance=a.alpha_f1_tolerance,auprc_tolerance=a.alpha_auprc_tolerance)
+        threshold=validation_selection["threshold"]
     adaptation_seconds=time.perf_counter()-adaptation_start
     peak_memory_bytes=(torch.cuda.max_memory_allocated(device) if device.type=="cuda" else 0)
     config=vars(a).copy(); config.update({"backbone_name":model.backbone_name,"alpha":model.alpha,"beta":model.beta,"threshold":threshold,
         "num_gmm_components":model.gmm_energy.num_components,"gmm_projection_dim":model.gmm_energy.projection_dim,
         "max_events":model.max_events,"fusion_shrinkage_strength":model.fusion.shrinkage_strength,
         "sequence_layers":model.sequence_layers,"dora_rank":model.target_adapter.rank,
+        "expert_dora_enabled":model.expert_dora_enabled,"dora_alpha":model.dora_alpha,
+        "deep_dora_enabled":model.deep_dora_enabled,"deep_dora_rank":model.deep_dora_rank,
+        "deep_dora_alpha":model.deep_dora_alpha,
         "disable_parameters":model.disable_parameters,"disable_gmm":model.disable_gmm})
     path=Path(a.output_dir)/f"{a.target_system}_adapted.pt"
     save_checkpoint(path,model,config,extra={"checkpoint_schema_version":2,"target_system":a.target_system,"hidden_dim":model.hidden_dim,"num_experts":model.num_experts,
         "system_to_expert":base.get("system_to_expert"),"source_normal_prototypes":prototypes,"trained_expert_mask":model.fusion.trained_mask.cpu(),"threshold":threshold,
+        "validation_selection":validation_selection,
         "trainable_parameters":trainable_parameters,"total_parameters":total_parameters,
         "trainable_parameter_ratio":trainable_parameters/max(total_parameters,1),"adaptation_seconds":adaptation_seconds,
         "peak_memory_bytes":peak_memory_bytes})
@@ -166,4 +255,7 @@ def main():
         "trainable_parameter_ratio":trainable_parameters/max(total_parameters,1),"adaptation_seconds":adaptation_seconds,
         "peak_memory_bytes":peak_memory_bytes,"checkpoint_size_bytes":path.stat().st_size}
     (Path(a.output_dir)/f"{a.target_system}_efficiency.json").write_text(json.dumps(efficiency,indent=2),encoding="utf-8")
+    if validation_selection is not None:
+        (Path(a.output_dir)/f"{a.target_system}_validation.json").write_text(
+            json.dumps(validation_selection,indent=2),encoding="utf-8")
 if __name__=="__main__": main()
